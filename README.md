@@ -114,6 +114,7 @@ Package for distribution:
 - First sync of a new shadow seeds from the server, then converges.
 - Note/card **deletions are propagated** (via graves). *Deck* deletions are not
   auto-propagated (left to avoid destructive surprises).
-- **Not yet handled:** truly excluding an `AnkiWeb only` deck *from* KelmaSync
-  (the master holds all decks).
+- Routing a deck to **AnkiWeb only** excludes it from KelmaSync sync. If that
+  deck already exists in the KelmaSync cloud from an earlier route, remove it
+  explicitly from the Kelma storage view; deck deletions are not automatic.
 - Treat host keys in the config as secrets.
