@@ -74,7 +74,7 @@ def reconcile_decks(
     deck_names: list[str],
     with_media: bool = True,
 ) -> int:
-    """Bulk (legacy) reconcile: copy all the decks' content in one apkg.
+    """Batched reconcile: copy all requested decks' content in one apkg.
 
     Returns the number of cards considered (0 if nothing to do).
     """

@@ -23,8 +23,8 @@ that service, and:
 
 Reconciliation uses Anki's own package import/export with `If Newer`, so merging
 (by note GUID, with scheduling + media) reuses Anki's battle-tested logic instead
-of a hand-rolled merge. **Deletions** are propagated separately by replaying each
-collection's `graves` (deleted note/card ids) into the other.
+of a hand-rolled merge. **Deletions** are propagated separately by diffing stable
+note GUIDs against the last converged sync snapshot.
 
 ```
             study here
@@ -80,16 +80,10 @@ single batched apkg — never one-deck-at-a-time. If nothing changed, it transfe
 nothing. The first sync after upgrading does one full pass to establish the
 baseline.
 
-KelmaSync has two sync paths (set in **Settings → KelmaSync mode**):
-
-- **Standard** (incremental) — fingerprints the collection in two quick SQL
-  queries, then moves only the decks that actually changed since the last sync,
-  all in **one** batched transfer. Routine syncs are near-instant.
-- **Legacy** — moves every routed deck every time; maximal compatibility with
-  **AnkiMobile** and stock Anki sync servers. Slower.
-- **Auto** (default) — probes the server (`GET /kelma/capabilities`) and picks
-  one; a server that advertises `{"legacy": true}` forces legacy. Manual choice
-  always wins.
+KelmaSync mode can be left on **Auto**. Auto probes the server
+(`GET /kelma/capabilities`) and records whether it advertises legacy-compatible
+sync behavior; all modes still use the same routed, change-detected
+reconciliation so unchanged decks are not re-exported.
 
 AnkiWeb is always legacy — real AnkiWeb only speaks the stock protocol.
 
@@ -108,12 +102,12 @@ Package for distribution:
 ./build.sh          # creates dist/kelma.ankiaddon
 ```
 
-## Status & limitations (v1)
+## Requirements and behavior
 
 - Requires modern Anki (Rust backend, ~23.10+).
 - First sync of a new shadow seeds from the server, then converges.
-- Note/card **deletions are propagated** (via graves). *Deck* deletions are not
-  auto-propagated (left to avoid destructive surprises).
+- Note/card **deletions are propagated** by GUID. *Deck* deletions are not
+  auto-propagated, to avoid destructive surprises.
 - Routing a deck to **AnkiWeb only** excludes it from KelmaSync sync. If that
   deck already exists in the KelmaSync cloud from an earlier route, remove it
   explicitly from the Kelma storage view; deck deletions are not automatic.

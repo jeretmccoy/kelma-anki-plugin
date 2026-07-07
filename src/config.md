@@ -13,9 +13,10 @@ each service and tick which decks sync where). The raw values:
 - **kelmasync_url**: your KelmaSync server base URL.
 - **kelmasync_hkey / kelmasync_user**: filled in after you log in (Tools → Kelma →
   Settings). The host key is a token, treat it like a password.
-- **kelmasync_path**: which KelmaSync sync path to use — `"auto"` (probe the
-  server), `"standard"` (per-deck reconcile, live progress), or `"legacy"` (bulk
-  transfer, AnkiMobile/stock-server compatible). AnkiWeb is always legacy.
+- **kelmasync_path**: which KelmaSync compatibility mode to record — `"auto"`
+  probes the server, `"standard"` uses the normal KelmaSync path, and `"legacy"`
+  marks a stock-compatible server. All modes still use routed, change-detected
+  reconciliation. AnkiWeb is always legacy.
 - **ankiweb_hkey / ankiweb_user**: filled in after AnkiWeb login.
 - **sync_media**: also sync media for each service.
 - **wrap_sync_button**: when `true`, the normal Sync button runs Kelma dual sync.
@@ -29,5 +30,3 @@ each service and tick which decks sync where). The raw values:
 - **Deck deletions** are not auto-propagated across the two collections (note and
   card deletions are). An emptied deck may linger on the other side until removed
   manually — this is deliberate, to avoid destructive surprises.
-- Reconciliation is by deck via Anki's package import (`If Newer`), so a card
-  moved *between* a routed and non-routed deck may need a manual sync to settle.
