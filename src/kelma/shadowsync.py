@@ -321,7 +321,7 @@ def sync_service(service: str, reporter: Reporter) -> dict:
         except Exception:  # noqa: BLE001 - best-effort close
             pass
 
-    state.mark_synced(st, service, path)
+    state.mark_synced(st, service, path, mw.col)
     state.save(st)
 
     return {
