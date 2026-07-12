@@ -23,6 +23,10 @@ SHADOW_FILENAME = {
 }
 
 DEFAULT_KELMA_URL = "https://sync.kelma.tech/"
+# Canonical KelmaSync v2 REST hostname. The old ankiai.tech alias remains live
+# for already-installed clients, but all new/default traffic uses kelma.tech.
+DEFAULT_V2_URL = "https://sync2.kelma.tech"
+LEGACY_V2_URLS = {"https://sync2.ankiai.tech"}
 
 # Account creation is web-based (branded sign-up, email verification, etc.), not
 # done in-client — the login dialog links out to these. KelmaSync accounts are
