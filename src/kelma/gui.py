@@ -2885,6 +2885,7 @@ def _mark_service_synced_for_badges(service: str) -> None:
     path = config.get().get("v2_url", "") if service == consts.KELMA else "AnkiWeb"
     state.mark_synced(st, service, path, mw.col)
     state.save(st)
+    deckbadges.invalidate_sizes()
     # Always refresh — the deck browser may not be the current state during a
     # sync (a progress dialog is showing), but when the user returns to it,
     # the cached render would still show stale +N badges.
