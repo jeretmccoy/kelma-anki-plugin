@@ -1,6 +1,6 @@
 """Shared constants for the Kelma Dual Sync add-on."""
 
-KELMA_CLIENT_VERSION = "1.0.121"
+KELMA_CLIENT_VERSION = "1.0.122"
 UPDATE_MANIFEST_URL = "https://kelma.tech/updates/v1.json"
 
 # Services

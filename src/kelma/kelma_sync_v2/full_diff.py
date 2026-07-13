@@ -60,6 +60,46 @@ def build_full_diff(col: Collection, client: V2Client) -> FullDiff:
     return diff
 
 
+def card_comparison_fingerprint(item: dict[str, Any] | None):
+    """Cross-collection card structure + normalized scheduling.
+
+    Parent deck paths may legitimately differ between Anki and KelmaSync while
+    the uniquely matched leaf deck and card are the same. Compare the leaf,
+    logical identity, and normalized scheduling instead of the raw checksum
+    (which includes the full deck path) or timestamp alone.
+    """
+    if item is None:
+        return None
+    sched = dict(item.get("scheduling") or {})
+    queue = int(sched.get("queue", 0) or 0)
+    due = int(sched.get("due", 0) or 0)
+    odue = int(sched.get("odue", 0) or 0)
+    crt_day = int(sched.get("_crt", 0) or 0) // 86400
+    if queue in (2, 3) and crt_day:
+        due += crt_day
+        if int(sched.get("odid", 0) or 0):
+            odue += crt_day
+    scheduling = (
+        int(sched.get("type", 0) or 0),
+        queue,
+        due,
+        int(sched.get("ivl", 0) or 0),
+        int(sched.get("factor", 0) or 0),
+        int(sched.get("reps", 0) or 0),
+        int(sched.get("lapses", 0) or 0),
+        int(sched.get("left", 0) or 0),
+        odue,
+        int(sched.get("flags", 0) or 0),
+    )
+    deck_leaf = str(item.get("deck_name", "")).rsplit("::", 1)[-1].casefold()
+    return (
+        str(item.get("note_guid", "")),
+        int(item.get("ord", 0) or 0),
+        deck_leaf,
+        scheduling,
+    )
+
+
 def _diff_keyed(
     local: list[dict[str, Any]],
     server: list[dict[str, Any]],
@@ -77,17 +117,14 @@ def _diff_keyed(
             out.append(DiffEntry(resource=key, key=k, status="server-only", server=s))
         else:
             assert l is not None and s is not None
-            if "checksum" in l and "checksum" in s:
-                status: Status = "in-sync" if l["checksum"] == s["checksum"] else "changed"
-                # Card checksums are deliberately structural and exclude
-                # scheduling. In the source-review UI, equal structure with a
-                # different scheduling timestamp must still be visible so the
-                # user can choose Anki/AnkiWeb or KelmaSync as canonical.
-                if key == "logical_key" and status == "in-sync":
-                    local_ts = str(l.get("modified_at") or "")
-                    server_ts = str(s.get("client_modified_at") or s.get("modified_at") or "")
-                    if local_ts != server_ts:
-                        status = "changed"
+            if key == "logical_key":
+                status = (
+                    "in-sync"
+                    if card_comparison_fingerprint(l) == card_comparison_fingerprint(s)
+                    else "changed"
+                )
+            elif "checksum" in l and "checksum" in s:
+                status = "in-sync" if l["checksum"] == s["checksum"] else "changed"
             elif "modified_at" in l and "modified_at" in s:
                 status = "in-sync" if l["modified_at"] == s["modified_at"] else "changed"
             else:

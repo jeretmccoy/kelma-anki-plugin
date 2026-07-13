@@ -1892,6 +1892,10 @@ def _ensure_v2_vendor() -> None:
     sys.modules["kelma_sync_v2"] = vendored
 
 
+def _deck_leaf(name: str) -> str:
+    return str(name).rsplit("::", 1)[-1].strip().casefold()
+
+
 def _v2_kelma_deck_names() -> list[str] | None:
     """Deck names to sync with KelmaSync.
 
@@ -1915,6 +1919,27 @@ def _v2_kelma_deck_names() -> list[str] | None:
         str(name) for name in (cfg.get("deck_routing") or {})
     )
     selected = set(config.decks_for_service(consts.KELMA, sorted(candidates)))
+
+    # A deck can be moved below a parent in Anki while the server retains its
+    # old flat name (for example `Mes Mots` vs
+    # `German Irregular Verbs::Mes Mots`). If each side has exactly one deck
+    # with that leaf, include the local alias in scope. An explicit route on the
+    # current full local name still wins and can intentionally exclude it.
+    routing = cfg.get("deck_routing") or {}
+    selected_routes_by_leaf: dict[str, list[str]] = {}
+    local_by_leaf: dict[str, list[str]] = {}
+    for name, services in routing.items():
+        if consts.KELMA in (services or []):
+            selected_routes_by_leaf.setdefault(_deck_leaf(name), []).append(str(name))
+    for name in names:
+        local_by_leaf.setdefault(_deck_leaf(name), []).append(name)
+    for leaf, route_names in selected_routes_by_leaf.items():
+        local_matches = local_by_leaf.get(leaf, [])
+        if len(route_names) == 1 and len(local_matches) == 1:
+            local_name = local_matches[0]
+            if local_name not in routing:
+                selected.add(local_name)
+
     # Lower layers expand selected parents to subdecks. Remove a parent from the
     # expansion list when any descendant is explicitly routed away, otherwise
     # that excluded child would be uploaded despite the user's routing choice.
@@ -2276,6 +2301,19 @@ class V2FullDiffDialog(QDialog):
             local = anki_local.local_manifest(
                 mw.col, deck_names=deck_names, progress=progress
             )
+            comparison_ntids = {
+                int(nt["notetype_id"]) for nt in local.get("notetypes", [])
+            }
+            comparison_ntids.update(
+                int(note["notetype_id"])
+                for note in server.get("notes", [])
+                if note.get("notetype_id") is not None
+            )
+            server["notetypes"] = [
+                nt for nt in server.get("notetypes", [])
+                if int(nt.get("notetype_id", 0)) in comparison_ntids
+            ]
+            _hide_equivalent_deck_aliases({"Client": local, "KelmaSync": server})
             progress("Comparing notes…")
             notes = _diff_keyed(
                 local.get("notes", []), server.get("notes", []), "guid"
@@ -2406,6 +2444,20 @@ class V2FullDiffDialog(QDialog):
                 p(f"⚠ Reading local collection failed: {err}")
                 tooltip(f"KelmaSync compare: local read failed: {err}")
                 return
+
+            comparison_ntids = {
+                int(nt["notetype_id"]) for nt in local.get("notetypes", [])
+            }
+            comparison_ntids.update(
+                int(note["notetype_id"])
+                for note in server.get("notes", [])
+                if note.get("notetype_id") is not None
+            )
+            server["notetypes"] = [
+                nt for nt in server.get("notetypes", [])
+                if int(nt.get("notetype_id", 0)) in comparison_ntids
+            ]
+            _hide_equivalent_deck_aliases({"Client": local, "KelmaSync": server})
 
             try:
                 from kelma_sync_v2.full_diff import _diff_keyed
@@ -3258,18 +3310,63 @@ def _v2_old_staged_menu() -> None:
 
 
 def _initial_deck_groups(local_names: list[str], server_names: list[str]) -> list[dict]:
-    """Case-insensitively match Anki/AnkiWeb and KelmaSync deck names."""
-    local_by_key: dict[str, set[str]] = {}
-    server_by_key: dict[str, set[str]] = {}
+    """Match exact deck paths first, then uniquely matching leaf names."""
+    local_by_full: dict[str, set[str]] = {}
+    server_by_full: dict[str, set[str]] = {}
     for name in local_names:
-        local_by_key.setdefault(str(name).casefold(), set()).add(str(name))
+        local_by_full.setdefault(str(name).casefold(), set()).add(str(name))
     for name in server_names:
-        server_by_key.setdefault(str(name).casefold(), set()).add(str(name))
+        server_by_full.setdefault(str(name).casefold(), set()).add(str(name))
+
+    pairs: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    used_local: set[str] = set()
+    used_server: set[str] = set()
+
+    # Preserve exact full-path matching as the strongest signal.
+    for key in sorted(set(local_by_full) & set(server_by_full)):
+        local = tuple(sorted(local_by_full[key], key=str.lower))
+        server = tuple(sorted(server_by_full[key], key=str.lower))
+        pairs.append((local, server))
+        used_local.update(local)
+        used_server.update(server)
+
+    # A deck may have gained/lost a parent while retaining the same contents.
+    # Match by leaf only when both sides are unique, avoiding ambiguous `Default`
+    # or repeated child names.
+    local_by_leaf: dict[str, list[str]] = {}
+    server_by_leaf: dict[str, list[str]] = {}
+    for name in local_names:
+        if name not in used_local:
+            local_by_leaf.setdefault(_deck_leaf(name), []).append(str(name))
+    for name in server_names:
+        if name not in used_server:
+            server_by_leaf.setdefault(_deck_leaf(name), []).append(str(name))
+    for leaf in sorted(set(local_by_leaf) & set(server_by_leaf)):
+        local = sorted(set(local_by_leaf[leaf]), key=str.lower)
+        server = sorted(set(server_by_leaf[leaf]), key=str.lower)
+        if len(local) == 1 and len(server) == 1:
+            pairs.append(((local[0],), (server[0],)))
+            used_local.add(local[0])
+            used_server.add(server[0])
+
+    # Keep every unmatched deck independently selectable.
+    for key in sorted(local_by_full):
+        local = tuple(
+            name for name in sorted(local_by_full[key], key=str.lower)
+            if name not in used_local
+        )
+        if local:
+            pairs.append((local, ()))
+    for key in sorted(server_by_full):
+        server = tuple(
+            name for name in sorted(server_by_full[key], key=str.lower)
+            if name not in used_server
+        )
+        if server:
+            pairs.append(((), server))
 
     groups = []
-    for key in sorted(set(local_by_key) | set(server_by_key)):
-        local = tuple(sorted(local_by_key.get(key, ()), key=str.lower))
-        server = tuple(sorted(server_by_key.get(key, ()), key=str.lower))
+    for local, server in pairs:
         names = tuple(dict.fromkeys(local + server))
         if local and server:
             status = "Matched in Anki/AnkiWeb and KelmaSync"
@@ -3289,7 +3386,75 @@ def _initial_deck_groups(local_names: list[str], server_names: list[str]) -> lis
             "server": server,
             "names": names,
         })
-    return groups
+    return sorted(groups, key=lambda group: group["display"].casefold())
+
+
+def _hide_equivalent_deck_aliases(manifests: dict[str, dict]) -> int:
+    """Hide deck-path aliases when config and card membership prove equivalence.
+
+    A parent-path change must not turn every card into a structural conflict.
+    We only collapse a leaf when every compared source has exactly one such deck,
+    deck config checksums agree, and differently named decks share card logical
+    identities. Ambiguous duplicate leaf names remain visible.
+    """
+    decks_by_source: dict[str, dict[str, list[dict]]] = {}
+    cards_by_source: dict[str, dict[str, set[str]]] = {}
+    for source, manifest in manifests.items():
+        deck_groups: dict[str, list[dict]] = {}
+        for deck in manifest.get("decks", []):
+            deck_groups.setdefault(_deck_leaf(deck.get("name", "")), []).append(deck)
+        decks_by_source[source] = deck_groups
+
+        card_groups: dict[str, set[str]] = {}
+        for card in manifest.get("cards", []):
+            deck_name = str(card.get("deck_name", ""))
+            logical = str(
+                card.get("logical_key")
+                or f"{card.get('note_guid', '')}:{int(card.get('ord', 0) or 0)}"
+            )
+            if deck_name and logical:
+                card_groups.setdefault(deck_name.casefold(), set()).add(logical)
+        cards_by_source[source] = card_groups
+
+    if not decks_by_source:
+        return 0
+    common_leaves = set.intersection(
+        *(set(groups) for groups in decks_by_source.values())
+    )
+    hidden: dict[str, set[str]] = {source: set() for source in manifests}
+    collapsed = 0
+    for leaf in common_leaves:
+        items = {
+            source: groups[leaf]
+            for source, groups in decks_by_source.items()
+        }
+        if any(len(values) != 1 for values in items.values()):
+            continue
+        one_each = {source: values[0] for source, values in items.items()}
+        checksums = {str(item.get("checksum", "")) for item in one_each.values()}
+        if len(checksums) != 1 or not next(iter(checksums), ""):
+            continue
+        full_names = {str(item.get("name", "")).casefold() for item in one_each.values()}
+        if len(full_names) > 1:
+            memberships = [
+                cards_by_source[source].get(
+                    str(item.get("name", "")).casefold(), set()
+                )
+                for source, item in one_each.items()
+            ]
+            if not memberships or not set.intersection(*memberships):
+                continue
+        for source, item in one_each.items():
+            hidden[source].add(str(item.get("name", "")).casefold())
+        collapsed += 1
+
+    if collapsed:
+        for source, manifest in manifests.items():
+            manifest["decks"] = [
+                deck for deck in manifest.get("decks", [])
+                if str(deck.get("name", "")).casefold() not in hidden[source]
+            ]
+    return collapsed
 
 
 def _save_initial_v2_routing(known_names: set[str], selected_names: set[str]) -> None:
@@ -3680,22 +3845,8 @@ class V2JointStateDialog(QDialog):
         if item is None:
             return None
         if resource == "cards":
-            sched = dict(item.get("scheduling") or {})
-            queue = int(sched.get("queue", 0) or 0)
-            due = int(sched.get("due", 0) or 0)
-            odue = int(sched.get("odue", 0) or 0)
-            crt_day = int(sched.get("_crt", 0) or 0) // 86400
-            if queue in (2, 3) and crt_day:
-                due += crt_day
-                if int(sched.get("odid", 0) or 0):
-                    odue += crt_day
-            scheduling = (
-                int(sched.get("type", 0) or 0), queue, due,
-                int(sched.get("ivl", 0) or 0), int(sched.get("factor", 0) or 0),
-                int(sched.get("reps", 0) or 0), int(sched.get("lapses", 0) or 0),
-                int(sched.get("left", 0) or 0), odue, int(sched.get("flags", 0) or 0),
-            )
-            return (item.get("checksum"), scheduling)
+            from kelma_sync_v2.full_diff import card_comparison_fingerprint
+            return card_comparison_fingerprint(item)
         return item.get("checksum")
 
     @staticmethod
@@ -3815,6 +3966,11 @@ class V2JointStateDialog(QDialog):
                     for nt in kelma.get("notetypes", [])
                     if int(nt.get("notetype_id", 0)) in comparison_ntids
                 ]
+                _hide_equivalent_deck_aliases({
+                    "Client": local,
+                    "AnkiWeb": ankiweb,
+                    "KelmaSync": kelma,
+                })
                 completed = True
                 return remote, local, ankiweb, kelma
             finally:
