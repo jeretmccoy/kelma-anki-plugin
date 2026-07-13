@@ -1,6 +1,6 @@
 """Shared constants for the Kelma Dual Sync add-on."""
 
-KELMA_CLIENT_VERSION = "1.0.120"
+KELMA_CLIENT_VERSION = "1.0.121"
 UPDATE_MANIFEST_URL = "https://kelma.tech/updates/v1.json"
 
 # Services
@@ -13,10 +13,9 @@ SERVICE_LABEL = {
     ANKIWEB: "AnkiWeb",
 }
 
-# Routing is purely per-deck: each deck syncs to a set of services. A deck with
-# no explicit routing (e.g. a newly created one) falls back to DEFAULT_SERVICES.
-# KelmaSync-only by default, so nothing is pushed to AnkiWeb until you opt a deck
-# in from the Settings dialog.
+# Historical fallback retained for upgraded profiles that have not used the v2
+# deck picker. Fresh v2 profiles materialize explicit routes and leave new,
+# unlisted top-level decks local until the user opts them into KelmaSync.
 DEFAULT_SERVICES = (KELMA,)
 
 # Shadow collection filenames (kept next to the master collection).

@@ -1657,6 +1657,9 @@ class SettingsDialog(QDialog):
         removed = old_kelma - new_kelma
 
         cfg["deck_routing"] = routing
+        cfg["v2_routing_initialized"] = True
+        # A deck created after this explicit choice remains local until selected.
+        cfg["v2_unrouted_decks_local"] = True
         cfg["enabled"] = self.enabled_cb.isChecked()
         cfg["sync_media"] = self.media_cb.isChecked()
         cfg["block_native_sync"] = self.block_cb.isChecked()
@@ -1899,8 +1902,19 @@ def _v2_kelma_deck_names() -> list[str] | None:
     """
     if config.kelmasync_only():
         return None
+    cfg = config.get()
     names = [d.name for d in mw.col.decks.all_names_and_ids()]
-    selected = set(config.decks_for_service(consts.KELMA, names))
+    # Keep explicitly selected server-only deck names in scope. They do not yet
+    # exist locally, so deriving scope only from mw.col would hide the very data
+    # a fresh installation needs to compare and optionally pull.
+    candidates = set(names)
+    # Include both selected and explicitly excluded server-only names. Excluded
+    # children must remain visible here so a selected parent cannot pull/upload
+    # them through prefix expansion.
+    candidates.update(
+        str(name) for name in (cfg.get("deck_routing") or {})
+    )
+    selected = set(config.decks_for_service(consts.KELMA, sorted(candidates)))
     # Lower layers expand selected parents to subdecks. Remove a parent from the
     # expansion list when any descendant is explicitly routed away, otherwise
     # that excluded child would be uploaded despite the user's routing choice.
@@ -1908,7 +1922,7 @@ def _v2_kelma_deck_names() -> list[str] | None:
         name for name in selected
         if not any(
             candidate.startswith(name + "::") and candidate not in selected
-            for candidate in names
+            for candidate in candidates
         )
     )
 
@@ -2190,6 +2204,15 @@ class V2FullDiffDialog(QDialog):
     def _load(self) -> None:
         """Start comparison without blocking/re-entering Qt's UI thread."""
         global _V2_ACTIVE_ACTION
+        if not config.kelmasync_only() and not config.v2_routing_initialized():
+            self._on_progress(
+                "First-time setup is required before comparing. Close this window "
+                "and choose Kelma → Review and sync changes; AnkiWeb will sync first, "
+                "then you will choose the KelmaSync decks."
+            )
+            self.btn_accept_all.setEnabled(False)
+            self.btn_force_all.setEnabled(False)
+            return
         blocked = _v2_active_message()
         if blocked:
             self._on_progress(f"⚠ {blocked}")
@@ -3234,6 +3257,200 @@ def _v2_old_staged_menu() -> None:
         _v2_forget_login()
 
 
+def _initial_deck_groups(local_names: list[str], server_names: list[str]) -> list[dict]:
+    """Case-insensitively match Anki/AnkiWeb and KelmaSync deck names."""
+    local_by_key: dict[str, set[str]] = {}
+    server_by_key: dict[str, set[str]] = {}
+    for name in local_names:
+        local_by_key.setdefault(str(name).casefold(), set()).add(str(name))
+    for name in server_names:
+        server_by_key.setdefault(str(name).casefold(), set()).add(str(name))
+
+    groups = []
+    for key in sorted(set(local_by_key) | set(server_by_key)):
+        local = tuple(sorted(local_by_key.get(key, ()), key=str.lower))
+        server = tuple(sorted(server_by_key.get(key, ()), key=str.lower))
+        names = tuple(dict.fromkeys(local + server))
+        if local and server:
+            status = "Matched in Anki/AnkiWeb and KelmaSync"
+            display = local[0]
+            if set(local) != set(server):
+                display += f"  (KelmaSync: {server[0]})"
+        elif server:
+            status = "KelmaSync only — available to pull"
+            display = server[0]
+        else:
+            status = "Anki/AnkiWeb only — not sent unless selected"
+            display = local[0]
+        groups.append({
+            "display": display,
+            "status": status,
+            "local": local,
+            "server": server,
+            "names": names,
+        })
+    return groups
+
+
+def _save_initial_v2_routing(known_names: set[str], selected_names: set[str]) -> None:
+    """Persist an explicit, non-destructive first KelmaSync scope."""
+    cfg = config.get()
+    routing = dict(cfg.get("deck_routing") or {})
+    for name in sorted(known_names):
+        # Preserve an explicit AnkiWeb choice if one exists, but never inherit
+        # the old implicit KelmaSync default while initializing fresh routing.
+        previous = routing.get(name, [])
+        services = [
+            service for service in consts.SERVICES
+            if service != consts.KELMA and service in previous
+        ]
+        if name in selected_names:
+            services.insert(0, consts.KELMA)
+        routing[name] = services
+    cfg["deck_routing"] = routing
+    cfg["v2_routing_initialized"] = True
+    cfg["v2_unrouted_decks_local"] = True
+    config.save(cfg)
+
+
+class V2InitialDeckRoutingDialog(QDialog):
+    """First-run Kelma deck picker, populated only after both clouds are read."""
+
+    def __init__(self, parent, local_names: list[str], server_names: list[str]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Choose decks for KelmaSync")
+        self.resize(820, 650)
+        self._groups = _initial_deck_groups(local_names, server_names)
+
+        layout = QVBoxLayout(self)
+        title = QLabel("<b>Choose what should continue syncing with KelmaSync</b>")
+        layout.addWidget(title)
+        help_text = QLabel(
+            "AnkiWeb has been synchronized first, and the existing KelmaSync deck "
+            "list has been fetched. Decks already present in KelmaSync are selected "
+            "and matched by name. Other Anki decks remain local/AnkiWeb-only unless "
+            "you select them. Unchecking a deck does not delete it from KelmaSync."
+        )
+        help_text.setWordWrap(True)
+        layout.addWidget(help_text)
+
+        matched = sum(bool(group["local"] and group["server"]) for group in self._groups)
+        server_only = sum(bool(group["server"] and not group["local"]) for group in self._groups)
+        local_only = sum(bool(group["local"] and not group["server"]) for group in self._groups)
+        overview = QLabel(
+            f"Matched: {matched} · KelmaSync only: {server_only} · "
+            f"Anki/AnkiWeb only: {local_only}"
+        )
+        layout.addWidget(overview)
+
+        controls = QHBoxLayout()
+        self.filter = QLineEdit()
+        self.filter.setPlaceholderText("Filter decks…")
+        self.filter.textChanged.connect(self._apply_filter)
+        controls.addWidget(self.filter)
+        current = QPushButton("Only current KelmaSync decks")
+        current.clicked.connect(lambda: self._bulk("server"))
+        controls.addWidget(current)
+        all_local = QPushButton("Add every Anki deck")
+        all_local.clicked.connect(lambda: self._bulk("local"))
+        controls.addWidget(all_local)
+        clear = QPushButton("Clear")
+        clear.clicked.connect(lambda: self._bulk("clear"))
+        controls.addWidget(clear)
+        layout.addLayout(controls)
+
+        self.table = QTableWidget(len(self._groups), 3)
+        self.table.setHorizontalHeaderLabels(["Deck", "Found in", "KelmaSync"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        for row, group in enumerate(self._groups):
+            name_item = QTableWidgetItem(group["display"])
+            name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.table.setItem(row, 0, name_item)
+            status_item = QTableWidgetItem(group["status"])
+            status_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.table.setItem(row, 1, status_item)
+            choice = QTableWidgetItem("✓ Sync" if group["server"] else "— Local/AnkiWeb")
+            choice.setFlags(_CHECKABLE)
+            choice.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            choice.setCheckState(
+                Qt.CheckState.Checked if group["server"] else Qt.CheckState.Unchecked
+            )
+            self.table.setItem(row, 2, choice)
+        self.table.itemChanged.connect(self._choice_changed)
+        layout.addWidget(self.table)
+
+        self.summary = QLabel()
+        layout.addWidget(self.summary)
+        self._update_summary()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Continue to comparison")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _choice_changed(self, item) -> None:
+        if item.column() != 2:
+            return
+        checked = item.checkState() == Qt.CheckState.Checked
+        item.setText("✓ Sync" if checked else "— Local/AnkiWeb")
+        self._update_summary()
+
+    def _apply_filter(self, text: str) -> None:
+        needle = text.casefold()
+        for row, group in enumerate(self._groups):
+            haystack = " ".join(group["names"]).casefold()
+            self.table.setRowHidden(row, needle not in haystack)
+
+    def _bulk(self, mode: str) -> None:
+        self.table.blockSignals(True)
+        try:
+            for row, group in enumerate(self._groups):
+                if self.table.isRowHidden(row):
+                    continue
+                checked = bool(group["server"]) if mode == "server" else (
+                    bool(group["local"] or group["server"])
+                    if mode == "local" else False
+                )
+                item = self.table.item(row, 2)
+                item.setCheckState(
+                    Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+                )
+                item.setText("✓ Sync" if checked else "— Local/AnkiWeb")
+        finally:
+            self.table.blockSignals(False)
+        self._update_summary()
+
+    def _update_summary(self) -> None:
+        selected = sum(
+            self.table.item(row, 2).checkState() == Qt.CheckState.Checked
+            for row in range(self.table.rowCount())
+        )
+        self.summary.setText(
+            f"{selected} deck group(s) selected for KelmaSync. "
+            "Everything else remains in Anki/AnkiWeb only."
+        )
+
+    def known_names(self) -> set[str]:
+        return {name for group in self._groups for name in group["names"]}
+
+    def selected_names(self) -> set[str]:
+        return {
+            name
+            for row, group in enumerate(self._groups)
+            if self.table.item(row, 2).checkState() == Qt.CheckState.Checked
+            for name in group["names"]
+        }
+
+
 class V2JointStateDialog(QDialog):
     """One workspace for fetching, choosing, and publishing all sync sources."""
 
@@ -3246,6 +3463,11 @@ class V2JointStateDialog(QDialog):
         self._client = _v2_client_or_login()
         self._remote_col = None
         self._fetching = False
+        self._onboarding = False
+        self._initial_kelma_manifest = None
+        self._initial_setup = (
+            not config.kelmasync_only() and not config.v2_routing_initialized()
+        )
         self._sources: dict[str, dict[str, dict]] = {}
         self._rows: list[tuple[str, str]] = []
         self._row_values: list[dict[str, dict | None]] = []
@@ -3255,7 +3477,7 @@ class V2JointStateDialog(QDialog):
         self._kelma_changes: list[dict] = []
         self._ankiweb_changes: list[dict] = []
         self._note_previews: dict[str, str] = {}
-        self._deck_names = _v2_kelma_deck_names()
+        self._deck_names: list[str] | None = None
 
         layout = QVBoxLayout(self)
         title = QLabel("<b>Choose what should be kept</b>")
@@ -3321,13 +3543,29 @@ class V2JointStateDialog(QDialog):
         layout.addLayout(actions)
         self._status_signal.connect(self.status.setText)
 
-        if self._client is None or (not self._deck_names and self._deck_names is not None):
-            self.status.setText("Sign in and choose at least one KelmaSync deck before reviewing changes.")
+        if self._client is None:
+            self.status.setText("Sign in to KelmaSync before reviewing changes.")
             self.apply_btn.setEnabled(False)
+        elif not config.kelmasync_only() and not config.v2_routing_initialized():
+            self._start_initial_routing()
         else:
-            self._fetch()
+            self._deck_names = _v2_kelma_deck_names()
+            if not self._deck_names and self._deck_names is not None:
+                self.status.setText(
+                    "No decks are selected for KelmaSync. Open Settings → deck routing "
+                    "to select a deck."
+                )
+                self.apply_btn.setEnabled(False)
+            else:
+                self._fetch()
 
     def reject(self) -> None:
+        if self._onboarding:
+            self.status.setText(
+                "First-time setup is still synchronizing AnkiWeb or reading KelmaSync. "
+                "Wait for the deck picker to appear."
+            )
+            return
         if self._fetching:
             self.status.setText(
                 "The independent AnkiWeb copy is still downloading. Its progress "
@@ -3341,6 +3579,101 @@ class V2JointStateDialog(QDialog):
                 pass
             self._remote_col = None
         super().reject()
+
+    def _start_initial_routing(self) -> None:
+        """AnkiWeb first, then Kelma manifest, deck picker, and scoped compare."""
+        self._onboarding = True
+        self.apply_btn.setEnabled(False)
+        self.publish_btn.setEnabled(False)
+        self.close_btn.setEnabled(False)
+        self.status.setText(
+            "First-time setup · Step 1 of 4: synchronizing this collection with AnkiWeb…"
+        )
+
+        def ankiweb_done(ok: bool, text: str) -> None:
+            if not ok:
+                self._onboarding = False
+                self.close_btn.setEnabled(True)
+                self.status.setText(
+                    f"First-time setup paused: {text} Sign in to AnkiWeb, then reopen "
+                    "Review and sync changes. Nothing was sent to KelmaSync."
+                )
+                return
+
+            self.status.setText(
+                "First-time setup · Step 2 of 4: reading existing KelmaSync decks…"
+            )
+            client = self._client
+
+            def read_sources():
+                manifest = client.manifest()
+                local_names = [d.name for d in mw.col.decks.all_names_and_ids()]
+                server_names = {
+                    str(deck.get("name", ""))
+                    for deck in manifest.get("decks", [])
+                    if deck.get("name")
+                }
+                # Current servers include deck_name in card manifests. Keep this
+                # fallback so a deck is still offered if its deck resource is
+                # temporarily absent but cards reference it.
+                server_names.update(
+                    str(card.get("deck_name", ""))
+                    for card in manifest.get("cards", [])
+                    if card.get("deck_name")
+                )
+                return manifest, sorted(set(local_names)), sorted(server_names)
+
+            def sources_ready(future: Future) -> None:
+                try:
+                    manifest, local_names, server_names = future.result()
+                except Exception as err:  # noqa: BLE001
+                    self._onboarding = False
+                    self.close_btn.setEnabled(True)
+                    self.status.setText(
+                        f"First-time setup could not read KelmaSync: {err}. "
+                        "No routing or server data was changed."
+                    )
+                    return
+
+                self.status.setText(
+                    "First-time setup · Step 3 of 4: choose the KelmaSync deck scope…"
+                )
+                picker = V2InitialDeckRoutingDialog(self, local_names, server_names)
+                if picker.exec() != QDialog.DialogCode.Accepted:
+                    self._onboarding = False
+                    self.close_btn.setEnabled(True)
+                    self.status.setText(
+                        "First-time setup paused before deck routing. Nothing was sent "
+                        "to or removed from KelmaSync."
+                    )
+                    return
+
+                _save_initial_v2_routing(
+                    picker.known_names(), picker.selected_names()
+                )
+                self._initial_kelma_manifest = manifest
+                self._deck_names = _v2_kelma_deck_names()
+                self._onboarding = False
+                self.close_btn.setEnabled(True)
+                if not self._deck_names:
+                    self.status.setText(
+                        "Setup complete: no decks were selected for KelmaSync. "
+                        "Your Anki/AnkiWeb collection was synchronized; nothing will "
+                        "be compared or published to KelmaSync until you select a deck."
+                    )
+                    return
+
+                self.status.setText(
+                    "First-time setup · Step 4 of 4: comparing only the selected and "
+                    "existing KelmaSync decks…"
+                )
+                self._fetch()
+
+            mw.taskman.run_in_background(
+                read_sources, sources_ready, uses_collection=True
+            )
+
+        _v2_run_ankiweb_sync(progress=self._status_signal.emit, done=ankiweb_done)
 
     @staticmethod
     def _fingerprint(resource: str, item: dict | None):
@@ -3379,6 +3712,7 @@ class V2JointStateDialog(QDialog):
         self.status.setText("Checking AnkiWeb without changing this computer…")
         client = self._client
         deck_names = self._deck_names
+        initial_kelma_manifest = self._initial_kelma_manifest
         auth = mw.pm.sync_auth()
         if not auth:
             self._fetching = False
@@ -3452,12 +3786,20 @@ class V2JointStateDialog(QDialog):
                 local = anki_local.local_manifest(mw.col, deck_names=deck_names)
                 self._status_signal.emit("Fetching KelmaSync snapshot…")
                 kelma = _scope_server_manifest_to_decks(
-                    client, client.manifest(), deck_names
+                    client, initial_kelma_manifest or client.manifest(), deck_names
                 )
                 comparison_ntids = {
                     int(nt["notetype_id"])
                     for nt in local["notetypes"] + ankiweb["notetypes"]
                 }
+                # A deck may exist only in KelmaSync on first setup. Include its
+                # note types so applying the selected server notes has the model
+                # dependency available locally.
+                comparison_ntids.update(
+                    int(note["notetype_id"])
+                    for note in kelma.get("notes", [])
+                    if note.get("notetype_id") is not None
+                )
                 local["notetypes"] = [
                     nt
                     for nt in local["notetypes"]
@@ -3552,6 +3894,30 @@ class V2JointStateDialog(QDialog):
         """Choose the uniquely newest copy, but never guess through a conflict."""
         sources = ("Client", "AnkiWeb", "KelmaSync")
         present = [source for source in sources if values[source] is not None]
+        if len(present) == 1 and self._initial_setup:
+            # During first setup the user has just chosen this deck after both
+            # services were read. Preserve the sole existing copy; never infer
+            # deletion merely because the other two sources do not have it yet.
+            source = present[0]
+            return source, (
+                f"First setup: this item currently exists only on "
+                f"{self._source_label(source)} and is selected for preservation."
+            )
+        if len(present) == 2:
+            left, right = present
+            if self._fingerprint(resource, values[left]) == self._fingerprint(
+                resource, values[right]
+            ):
+                # Two independent copies agree and the third is absent. Keep an
+                # existing copy (never auto-select deletion) and let Publish add
+                # it to the missing service.
+                source = "Client" if "Client" in present else left
+                missing = next(name for name in sources if name not in present)
+                agree = " and ".join(self._source_label(name) for name in present)
+                return source, (
+                    f"Matched: {self._sentence_start(agree)} contain the same version; "
+                    f"it can be added to {self._source_label(missing)}."
+                )
         if len(present) != 3:
             return None, "Conflict: at least one copy is missing. Choose whether to keep the item or remove it."
 
@@ -3769,7 +4135,7 @@ class V2JointStateDialog(QDialog):
             )
             self.status.setText(
                 f"Found {len(rows):,} difference(s): {summary}. "
-                f"{counts['newest']} newest version(s) were selected automatically. "
+                f"{counts['newest']} safe matching/newest version(s) were selected automatically. "
                 f"{conflict_text}{shown_text}"
             )
             self._update_apply_state()
@@ -4006,6 +4372,13 @@ class V2JointStateDialog(QDialog):
             prepare_ankiweb()
 
         mw.taskman.run_in_background(push_kelma, kelma_done, uses_collection=True)
+
+
+def _v2_compare_or_onboard() -> None:
+    if not config.kelmasync_only() and not config.v2_routing_initialized():
+        V2JointStateDialog(mw).exec()
+    else:
+        V2FullDiffDialog(mw).exec()
 
 
 def _v2_sync_menu() -> None:
@@ -4354,7 +4727,7 @@ def _build_menu() -> None:
         menu.addAction(act_staged)
 
     act_compare = QAction("Compare everything…", mw)
-    act_compare.triggered.connect(lambda: V2FullDiffDialog(mw).exec())
+    act_compare.triggered.connect(_v2_compare_or_onboard)
     menu.addAction(act_compare)
 
     menu.addSeparator()

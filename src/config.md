@@ -22,8 +22,10 @@ each service and tick which decks sync where). The raw values:
 - **wrap_sync_button**: when `true`, the normal Sync button runs Kelma dual sync.
 - **backup_before_sync**: create a backup before each dual sync (recommended).
 - **deck_routing**: map of `deck name → list of services`, e.g.
-  `{"Spanish": ["kelma", "ankiweb"], "Immersion": ["kelma"]}`. Decks not listed
-  default to KelmaSync only. Edit via Tools → Kelma → Settings & deck routing.
+  `{"Spanish": ["kelma", "ankiweb"], "Immersion": ["kelma"]}`. On first v2 use,
+  AnkiWeb syncs first, existing KelmaSync deck names are matched, and the user
+  explicitly chooses the KelmaSync scope. After that, unlisted/new top-level
+  decks remain local until selected. Edit via Tools → Kelma → Settings & deck routing.
 
 ## Known limitations (v1)
 

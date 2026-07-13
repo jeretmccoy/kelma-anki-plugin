@@ -139,12 +139,43 @@ def _scope_server_manifest_to_decks(client: V2Client, manifest: dict[str, Any], 
             return True
         return any(deck.startswith(name + "::") for name in allowed)
 
-    card_ids = [int(c["card_id"]) for c in manifest.get("cards", []) if c.get("card_id")]
+    manifest_cards = list(manifest.get("cards", []))
     scoped_card_ids: set[int] = set()
     scoped_note_guids: set[str] = set()
+
+    # Current manifests carry deck_name + logical card identity. Use those cheap
+    # fields to identify scope before pulling full scheduling records: selecting
+    # a few Kelma decks must not download all 92,000 Anki cards merely to learn
+    # their deck assignments. Older servers fall back to the full scan.
+    has_manifest_decks = all(
+        not card.get("card_id") or bool(card.get("deck_name"))
+        for card in manifest_cards
+    )
+    if has_manifest_decks:
+        candidates = [
+            card for card in manifest_cards
+            if card.get("card_id") and _in_scope(str(card.get("deck_name", "")))
+        ]
+        card_ids = [int(card["card_id"]) for card in candidates]
+        scoped_card_ids.update(card_ids)
+        scoped_note_guids.update(
+            str(card["note_guid"])
+            for card in candidates
+            if card.get("note_guid")
+        )
+    else:
+        card_ids = [
+            int(card["card_id"])
+            for card in manifest_cards
+            if card.get("card_id")
+        ]
+
     if card_ids:
         if progress:
-            progress(f"Server scope: checking {len(card_ids)} card deck assignments…")
+            progress(
+                f"Server scope: loading {len(card_ids)} selected card record(s) "
+                f"from {len(manifest_cards)} total…"
+            )
         done = 0
         for chunk in _chunks(card_ids):
             pulled = client.batch_pull(cards=chunk).get("cards", [])
@@ -156,21 +187,23 @@ def _scope_server_manifest_to_decks(client: V2Client, manifest: dict[str, Any], 
                     guid = c.get("note_guid")
                     if guid:
                         scoped_note_guids.add(str(guid))
-            # Enrich manifest entries with stable logical card identity for
-            # cross-collection comparison. card_id is a local creation timestamp
-            # and differs across clients; (note_guid, ord) is the real card key.
-            for m in manifest.get("cards", []):
+            # Enrich manifest entries with stable logical card identity and
+            # scheduling. card_id differs across clients; (note_guid, ord) is
+            # the cross-device key.
+            for m in manifest_cards:
                 cid = int(m.get("card_id", 0) or 0)
                 c = by_id.get(cid)
                 if c:
-                    m["note_guid"] = c.get("note_guid") or ""
-                    m["ord"] = int(c.get("ord") or 0)
-                    m["deck_name"] = c.get("deck_name") or ""
+                    m["note_guid"] = c.get("note_guid") or m.get("note_guid") or ""
+                    m["ord"] = int(c.get("ord") or m.get("ord") or 0)
+                    m["deck_name"] = c.get("deck_name") or m.get("deck_name") or ""
                     m["scheduling"] = dict(c.get("scheduling") or {})
                     m["logical_key"] = f"{m['note_guid']}:{m['ord']}"
             done += len(chunk)
             if progress:
-                progress(f"Server scope: {done}/{len(card_ids)} cards checked · {len(scoped_card_ids)} in Kelma decks")
+                progress(
+                    f"Server scope: {done}/{len(card_ids)} selected cards loaded"
+                )
     scoped = dict(manifest)
     scoped["cards"] = [c for c in manifest.get("cards", []) if int(c.get("card_id", 0)) in scoped_card_ids]
     scoped["notes"] = [n for n in manifest.get("notes", []) if str(n.get("guid", "")) in scoped_note_guids]
