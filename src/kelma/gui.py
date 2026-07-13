@@ -4,6 +4,7 @@ plus integration with the Sync button."""
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import re
 import sys
@@ -11,7 +12,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import Future
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from aqt import mw
@@ -1413,7 +1414,10 @@ class SettingsDialog(QDialog):
             "<b>✓ KelmaSync</b> = synced to Kelma; <b>— local only</b> = stays local."
         )
         if not config.kelmasync_only():
-            route_help += " In Anki, a deck can be <b>KelmaSync</b>, <b>AnkiWeb</b>, <b>both</b>, or <b>neither</b>."
+            route_help += (
+                " Native <b>AnkiWeb is collection-wide</b>, so every deck is "
+                "shown on AnkiWeb whenever this Anki profile is signed in."
+            )
         route_help += " <b>Shift-click</b> a box to set a range."
         outer.addWidget(QLabel(route_help))
         self.route_summary = QLabel()
@@ -1435,7 +1439,10 @@ class SettingsDialog(QDialog):
             ("All KelmaSync", consts.KELMA, True),
             ("Clear KelmaSync", consts.KELMA, False),
         ]
-        if consts.ANKIWEB in config.ui_services():
+        if (
+            consts.ANKIWEB in config.ui_services()
+            and not config.has_native_ankiweb_auth()
+        ):
             bulk_buttons += [
                 ("All AnkiWeb", consts.ANKIWEB, True),
                 ("Clear AnkiWeb", consts.ANKIWEB, False),
@@ -1582,7 +1589,10 @@ class SettingsDialog(QDialog):
             services = config.services_for_deck(name)
             for service, col in _COL.items():
                 item = QTableWidgetItem()
-                item.setFlags(_CHECKABLE)
+                if service == consts.ANKIWEB and config.has_native_ankiweb_auth():
+                    item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                else:
+                    item.setFlags(_CHECKABLE)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 checked = service in services
                 item.setCheckState(
@@ -3897,14 +3907,25 @@ class V2JointStateDialog(QDialog):
             try:
                 remote_auth = type(auth)()
                 remote_auth.CopyFrom(auth)
+                meta_path = Path(cache_path).with_name(
+                    "kelma_ankiweb_compare.meta.json"
+                )
+                try:
+                    cache_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001
+                    cache_meta = {}
+                auth_hash = hashlib.sha256(
+                    str(remote_auth.hkey).encode("utf-8")
+                ).hexdigest()
+
                 handshake = remote.sync_collection(remote_auth, False)
                 if handshake.new_endpoint:
                     remote_auth.endpoint = handshake.new_endpoint
-                if handshake.required != handshake.NO_CHANGES:
-                    self._status_signal.emit(
-                        "AnkiWeb requires an independent full download; this computer's "
-                        "collection remains untouched."
-                    )
+                performed_full_download = False
+
+                def full_download(reason: str) -> None:
+                    nonlocal performed_full_download
+                    self._status_signal.emit(reason)
                     remote.close_for_full_sync()
                     remote.full_upload_or_download(
                         auth=remote_auth,
@@ -3912,40 +3933,103 @@ class V2JointStateDialog(QDialog):
                         upload=False,
                     )
                     remote.reopen(after_full_sync=True)
+                    performed_full_download = True
+
+                if handshake.required != handshake.NO_CHANGES:
+                    full_download(
+                        "AnkiWeb requires an independent full download; this "
+                        "computer's collection remains untouched."
+                    )
+                elif (
+                    cache_meta.get("auth_sha256")
+                    and cache_meta.get("auth_sha256") != auth_hash
+                ):
+                    full_download(
+                        "The AnkiWeb account changed; rebuilding its independent "
+                        "comparison copy without changing this computer…"
+                    )
+
                 self._status_signal.emit("Reading independent AnkiWeb snapshot…")
-                ankiweb = anki_local.local_manifest(remote, deck_names=deck_names)
                 local = anki_local.local_manifest(mw.col, deck_names=deck_names)
+                ankiweb = anki_local.local_manifest(remote, deck_names=deck_names)
                 self._status_signal.emit("Fetching KelmaSync snapshot…")
                 kelma = _scope_server_manifest_to_decks(
                     client, initial_kelma_manifest or client.manifest(), deck_names
                 )
-                comparison_ntids = {
-                    int(nt["notetype_id"])
-                    for nt in local["notetypes"] + ankiweb["notetypes"]
-                }
-                # A deck may exist only in KelmaSync on first setup. Include its
-                # note types so applying the selected server notes has the model
-                # dependency available locally.
-                comparison_ntids.update(
-                    int(note["notetype_id"])
-                    for note in kelma.get("notes", [])
-                    if note.get("notetype_id") is not None
+
+                def scope_notetypes() -> None:
+                    comparison_ntids = {
+                        int(nt["notetype_id"])
+                        for nt in local["notetypes"] + ankiweb["notetypes"]
+                    }
+                    comparison_ntids.update(
+                        int(note["notetype_id"])
+                        for note in kelma.get("notes", [])
+                        if note.get("notetype_id") is not None
+                    )
+                    local["notetypes"] = [
+                        nt for nt in local["notetypes"]
+                        if int(nt["notetype_id"]) in comparison_ntids
+                    ]
+                    ankiweb["notetypes"] = [
+                        nt for nt in ankiweb["notetypes"]
+                        if int(nt["notetype_id"]) in comparison_ntids
+                    ]
+                    kelma["notetypes"] = [
+                        nt for nt in kelma.get("notetypes", [])
+                        if int(nt.get("notetype_id", 0)) in comparison_ntids
+                    ]
+
+                scope_notetypes()
+
+                from kelma_sync_v2.comparison_cache import (
+                    count_matching_items_missing_from_source,
                 )
-                local["notetypes"] = [
-                    nt
-                    for nt in local["notetypes"]
-                    if int(nt["notetype_id"]) in comparison_ntids
-                ]
-                ankiweb["notetypes"] = [
-                    nt
-                    for nt in ankiweb["notetypes"]
-                    if int(nt["notetype_id"]) in comparison_ntids
-                ]
-                kelma["notetypes"] = [
-                    nt
-                    for nt in kelma.get("notetypes", [])
-                    if int(nt.get("notetype_id", 0)) in comparison_ntids
-                ]
+
+                cache_usn = int(remote.db.scalar("SELECT usn FROM col") or 0)
+                suspicious_missing = count_matching_items_missing_from_source(
+                    {
+                        "Client": local,
+                        "AnkiWeb": ankiweb,
+                        "KelmaSync": kelma,
+                    },
+                    missing_source="AnkiWeb",
+                    agreement_sources=("Client", "KelmaSync"),
+                    resources=("notes", "cards", "notetypes"),
+                    key_for=self._key,
+                    fingerprint_for=self._fingerprint,
+                )
+                verified_usn = int(
+                    cache_meta.get("full_verified_missing_usn", -1) or -1
+                )
+                if (
+                    suspicious_missing
+                    and not performed_full_download
+                    and verified_usn != cache_usn
+                ):
+                    full_download(
+                        f"The incremental AnkiWeb cache reports {suspicious_missing:,} "
+                        "matching item(s) missing. Verifying once with a fresh "
+                        "read-only AnkiWeb download…"
+                    )
+                    ankiweb = anki_local.local_manifest(
+                        remote, deck_names=deck_names
+                    )
+                    scope_notetypes()
+                    cache_usn = int(remote.db.scalar("SELECT usn FROM col") or 0)
+                    cache_meta["full_verified_missing_usn"] = cache_usn
+
+                cache_meta.update({
+                    "auth_sha256": auth_hash,
+                    "last_sync_usn": cache_usn,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                })
+                temp_meta = meta_path.with_suffix(meta_path.suffix + ".tmp")
+                temp_meta.write_text(
+                    json.dumps(cache_meta, sort_keys=True), encoding="utf-8"
+                )
+                temp_meta.replace(meta_path)
+
                 _prepare_deck_namespace_comparison({
                     "Client": local,
                     "AnkiWeb": ankiweb,

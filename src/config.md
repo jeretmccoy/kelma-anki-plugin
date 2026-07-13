@@ -1,9 +1,10 @@
 # Kelma Dual Sync — configuration
 
-This add-on keeps your collection synced to **KelmaSync** and/or **AnkiWeb** with
-**per-deck routing**. You study in your normal collection; the add-on maintains
-two background *shadow* collections (one per service), syncs each two-way to its
-server, and reconciles shared decks between them.
+This add-on compares your collection with **KelmaSync** and **AnkiWeb**.
+KelmaSync is explicitly routed per deck. Native AnkiWeb collection sync is
+collection-wide, so every deck displays an AnkiWeb badge whenever the current
+Anki profile is signed in. The independent AnkiWeb comparison cache never
+replaces the user's active collection.
 
 Everything is managed from **Tools → Kelma → Settings & deck routing** (log in to
 each service and tick which decks sync where). The raw values:

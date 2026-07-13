@@ -82,6 +82,16 @@ def set_value(key: str, value: Any) -> None:
     save(cfg)
 
 
+def has_native_ankiweb_auth() -> bool:
+    """Whether this Anki profile is logged into native collection sync."""
+    if kelmasync_only():
+        return False
+    try:
+        return bool(mw and mw.pm and mw.pm.sync_auth())
+    except Exception:  # noqa: BLE001 - profile may be opening/closing
+        return False
+
+
 def has_credentials(service: str) -> bool:
     cfg = get()
     if service == consts.KELMA:
@@ -89,7 +99,9 @@ def has_credentials(service: str) -> bool:
         # upgraded profiles, but fresh Desktop/Mobile-era logins only have
         # v2_token and must still show badges/account state.
         return bool(cfg.get("v2_token") or cfg.get("kelmasync_hkey"))
-    return bool(cfg["ankiweb_hkey"])
+    # v2 uses Anki's native profile authentication. Fresh Windows installs do
+    # not populate the obsolete add-on ankiweb_hkey field.
+    return has_native_ankiweb_auth() or bool(cfg["ankiweb_hkey"])
 
 
 def _normalize(services: Any) -> tuple[str, ...]:
@@ -105,22 +117,31 @@ def v2_routing_initialized() -> bool:
 def services_for_deck(deck_name: str) -> tuple[str, ...]:
     """Services a deck syncs to: explicit entry, else nearest ancestor.
 
-    Legacy/upgraded configurations retain the historical default. Once the user
-    has completed the v2 deck picker, an unmentioned/new deck stays local until
-    the user explicitly opts it into KelmaSync.
+    KelmaSync remains explicitly routed. Native AnkiWeb collection sync is not
+    capable of per-deck routing, so every deck is on AnkiWeb whenever the Anki
+    profile has native sync authentication.
     """
     cfg = get()
     routing: dict[str, Any] = cfg["deck_routing"]
     if deck_name in routing:
-        return _normalize(routing[deck_name])
-    parts = deck_name.split("::")
-    for i in range(len(parts) - 1, 0, -1):
-        ancestor = "::".join(parts[:i])
-        if ancestor in routing:
-            return _normalize(routing[ancestor])
-    if cfg.get("v2_unrouted_decks_local", False):
-        return ()
-    return consts.DEFAULT_SERVICES
+        services = _normalize(routing[deck_name])
+    else:
+        services = ()
+        parts = deck_name.split("::")
+        for i in range(len(parts) - 1, 0, -1):
+            ancestor = "::".join(parts[:i])
+            if ancestor in routing:
+                services = _normalize(routing[ancestor])
+                break
+        else:
+            if not cfg.get("v2_unrouted_decks_local", False):
+                services = consts.DEFAULT_SERVICES
+    if has_native_ankiweb_auth() and consts.ANKIWEB not in services:
+        services = tuple(
+            service for service in consts.SERVICES
+            if service in services or service == consts.ANKIWEB
+        )
+    return services
 
 
 def decks_for_service(service: str, all_deck_names: list[str]) -> list[str]:
