@@ -2116,6 +2116,8 @@ class V2NoteConflictDialog(QDialog):
 class V2FullDiffDialog(QDialog):
     """Source-selection UI for local/AnkiWeb vs KelmaSync differences."""
 
+    _progress_signal = pyqtSignal(str)
+
     def __init__(self, parent=None, *, reconcile_mode: bool = False, ankiweb_changes: int = 0, staged_mode: bool = False) -> None:
         super().__init__(parent)
         self._reconcile_mode = reconcile_mode
@@ -2180,13 +2182,152 @@ class V2FullDiffDialog(QDialog):
         layout.addWidget(buttons)
 
         self._diff = None
+        self._progress_signal.connect(self._on_progress)
         self._load()
 
     def _on_progress(self, text: str) -> None:
         self.status_label.setText(text)
-        QApplication.processEvents()
 
     def _load(self) -> None:
+        """Start comparison without blocking/re-entering Qt's UI thread."""
+        global _V2_ACTIVE_ACTION
+        blocked = _v2_active_message()
+        if blocked:
+            self._on_progress(f"⚠ {blocked}")
+            self.btn_accept_all.setEnabled(False)
+            self.btn_force_all.setEnabled(False)
+            return
+        try:
+            self._on_progress("Connecting…")
+            client = _v2_client_or_login()
+        except Exception as err:  # noqa: BLE001
+            self._on_progress(f"⚠ Login error: {err}")
+            return
+        if client is None:
+            self._on_progress("Not logged in. Open the sync menu → Settings to log in.")
+            return
+        try:
+            deck_names = _v2_kelma_deck_names()
+        except Exception as err:  # noqa: BLE001
+            self._on_progress(f"⚠ Could not determine deck scope: {err}")
+            return
+        if not deck_names and deck_names is not None:
+            self._on_progress(
+                "No decks are picked for KelmaSync. Open Settings → deck routing "
+                "and tick KelmaSync for at least one deck."
+            )
+            return
+
+        self._client = client
+        _V2_ACTIVE_ACTION = "compare"
+        self.btn_accept_all.setEnabled(False)
+        self.btn_force_all.setEnabled(False)
+        self.continue_button.setEnabled(False)
+        self._on_progress(
+            "Scope: all decks (KelmaDesktop)"
+            if deck_names is None
+            else f"Scope: {len(deck_names)} KelmaSync deck(s)"
+        )
+
+        def progress(text: str) -> None:
+            self._progress_signal.emit(text)
+
+        def work():
+            import time as _t
+            from types import SimpleNamespace
+            from kelma_sync_v2 import anki_local
+            from kelma_sync_v2.content_sync import _scope_server_manifest_to_decks
+            from kelma_sync_v2.full_diff import _diff_keyed
+
+            progress("Contacting server…")
+            t0 = _t.time()
+            server = client.manifest()
+            server = _scope_server_manifest_to_decks(
+                client, server, deck_names, progress=progress
+            )
+            progress(
+                f"Server: {len(server.get('notes', []))} notes, "
+                f"{len(server.get('cards', []))} cards, "
+                f"{len(server.get('notetypes', []))} notetypes, "
+                f"{len(server.get('decks', []))} decks ({_t.time()-t0:.1f}s)"
+            )
+            local = anki_local.local_manifest(
+                mw.col, deck_names=deck_names, progress=progress
+            )
+            progress("Comparing notes…")
+            notes = _diff_keyed(
+                local.get("notes", []), server.get("notes", []), "guid"
+            )
+            progress("Comparing cards…")
+            cards = _diff_keyed(
+                local.get("cards", []), server.get("cards", []), "logical_key"
+            )
+            progress("Comparing notetypes…")
+            notetypes = _diff_keyed(
+                local.get("notetypes", []),
+                server.get("notetypes", []),
+                "notetype_id",
+            )
+            progress("Comparing decks…")
+            decks = _diff_keyed(
+                local.get("decks", []), server.get("decks", []), "name"
+            )
+            first_changed = 0
+            for idx, entries in enumerate((notes, notetypes, decks, cards)):
+                if any(entry.status != "in-sync" for entry in entries):
+                    first_changed = idx
+                    break
+            total_changed = sum(
+                1
+                for entries in (notes, notetypes, decks, cards)
+                for entry in entries
+                if entry.status != "in-sync"
+            )
+            return SimpleNamespace(
+                notes=notes,
+                cards=cards,
+                notetypes=notetypes,
+                decks=decks,
+                server_time=server.get("server_time", ""),
+                first_changed=first_changed,
+                total_changed=total_changed,
+            )
+
+        def done(future: Future) -> None:
+            global _V2_ACTIVE_ACTION
+            if _V2_ACTIVE_ACTION == "compare":
+                _V2_ACTIVE_ACTION = None
+            try:
+                self.btn_accept_all.setEnabled(True)
+                self.btn_force_all.setEnabled(True)
+                self.continue_button.setEnabled(True)
+            except RuntimeError:
+                # The user closed the dialog while its worker was finishing.
+                return
+            try:
+                loaded = future.result()
+            except Exception as err:  # noqa: BLE001
+                self._on_progress(f"⚠ Compare failed: {err}")
+                tooltip(f"KelmaSync compare failed: {err}")
+                return
+            self._diff = loaded
+            self.resource_combo.setCurrentIndex(loaded.first_changed)
+            if loaded.total_changed == 0:
+                try:
+                    _mark_service_synced_for_badges(consts.KELMA)
+                    self._on_progress("Everything matches KelmaSync — badges reset.")
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                self._on_progress("Building table…")
+            try:
+                self._populate()
+            except Exception as err:  # noqa: BLE001
+                self._on_progress(f"⚠ Failed to render: {err}")
+
+        mw.taskman.run_in_background(work, done, uses_collection=True)
+
+    def _load_legacy(self) -> None:
         # Hard guard: a sync task owns Anki's collection queue. If Compare starts
         # while sync is running, do NOT queue behind it and look hung.
         global _V2_ACTIVE_ACTION
