@@ -112,7 +112,11 @@ def push_selected_client_state(
     by_resource: dict[str, list[dict[str, Any]]] = {
         "notetypes": [], "decks": [], "notes": [], "cards": [],
     }
+    namespace_changes: list[dict[str, Any]] = []
     for change in changes:
+        if change.get("namespace"):
+            namespace_changes.append(change)
+            continue
         resource = str(change["resource"])
         if resource in by_resource:
             by_resource[resource].append(change)
@@ -144,6 +148,66 @@ def push_selected_client_state(
         elif resource == "decks":
             client.delete_deck(key)
         totals["deleted"] += 1
+
+    # A namespace mismatch is one user decision but can cover thousands of
+    # cards. Publish it as one deck upsert plus batched logical-card upserts,
+    # then remove the old empty server deck path.
+    for change in namespace_changes:
+        selected_name = str(change.get("selected_namespace") or "")
+        server_name = str(change.get("target_namespace") or "")
+        if not selected_name:
+            raise RuntimeError("namespace change is missing selected_namespace")
+        deck_record = anki_local.deck_record(col, selected_name)
+        if not deck_record:
+            raise RuntimeError(f"selected namespace deck not found: {selected_name}")
+        deck_payload = {
+            key: deck_record[key]
+            for key in ("name", "config", "client_modified_at")
+        }
+        deck_payload["base_checksum"] = ""
+        response = client.batch_push({
+            "notes": [], "cards": [], "notetypes": [], "decks": [deck_payload],
+        }, force=True)
+        totals["decks"] += int((response.get("accepted") or {}).get("decks", 0))
+
+        deck = col.decks.by_name(selected_name)
+        if deck is None:
+            raise RuntimeError(f"selected namespace deck not found: {selected_name}")
+        card_ids = [
+            int(card_id)
+            for card_id in col.db.list(
+                "SELECT id FROM cards WHERE did=? ORDER BY id", int(deck["id"])
+            )
+        ]
+        if progress:
+            progress(
+                f"Publishing deck namespace {selected_name}: {len(card_ids)} cards…"
+            )
+        for start in range(0, len(card_ids), _BATCH):
+            records = []
+            for card_id in card_ids[start:start + _BATCH]:
+                record = anki_local.card_record(col, card_id)
+                if not record:
+                    continue
+                records.append({
+                    key: record[key]
+                    for key in (
+                        "card_id", "note_guid", "deck_name", "ord",
+                        "scheduling", "client_modified_at",
+                    )
+                })
+            response = client.batch_push({
+                "notes": [], "cards": records, "notetypes": [], "decks": [],
+            }, force=True)
+            totals["cards"] += int((response.get("accepted") or {}).get("cards", 0))
+            if progress:
+                progress(
+                    f"Deck namespace: {min(start + _BATCH, len(card_ids))}/"
+                    f"{len(card_ids)} cards published"
+                )
+        if server_name and server_name != selected_name:
+            client.delete_deck(server_name)
+            totals["deleted"] += 1
 
     for resource in ("decks", "notetypes", "notes", "cards"):
         records = []

@@ -91,11 +91,14 @@ def card_comparison_fingerprint(item: dict[str, Any] | None):
         odue,
         int(sched.get("flags", 0) or 0),
     )
-    deck_leaf = str(item.get("deck_name", "")).rsplit("::", 1)[-1].casefold()
+    deck_identity = str(
+        item.get("comparison_namespace_group")
+        or str(item.get("deck_name", "")).rsplit("::", 1)[-1].casefold()
+    )
     return (
         str(item.get("note_guid", "")),
         int(item.get("ord", 0) or 0),
-        deck_leaf,
+        deck_identity,
         scheduling,
     )
 

@@ -1935,10 +1935,14 @@ def _v2_kelma_deck_names() -> list[str] | None:
         local_by_leaf.setdefault(_deck_leaf(name), []).append(name)
     for leaf, route_names in selected_routes_by_leaf.items():
         local_matches = local_by_leaf.get(leaf, [])
-        if len(route_names) == 1 and len(local_matches) == 1:
-            local_name = local_matches[0]
-            if local_name not in routing:
-                selected.add(local_name)
+        if len(route_names) == 1:
+            # Include every same-leaf candidate in the read-only comparison.
+            # Card-membership matching later identifies the real namespace
+            # counterpart and collapses it to one decision. Explicit routes on
+            # a full local path still win and can exclude a candidate.
+            for local_name in local_matches:
+                if local_name not in routing:
+                    selected.add(local_name)
 
     # Lower layers expand selected parents to subdecks. Remove a parent from the
     # expansion list when any descendant is explicitly routed away, otherwise
@@ -2313,7 +2317,6 @@ class V2FullDiffDialog(QDialog):
                 nt for nt in server.get("notetypes", [])
                 if int(nt.get("notetype_id", 0)) in comparison_ntids
             ]
-            _hide_equivalent_deck_aliases({"Client": local, "KelmaSync": server})
             progress("Comparing notes…")
             notes = _diff_keyed(
                 local.get("notes", []), server.get("notes", []), "guid"
@@ -2457,8 +2460,6 @@ class V2FullDiffDialog(QDialog):
                 nt for nt in server.get("notetypes", [])
                 if int(nt.get("notetype_id", 0)) in comparison_ntids
             ]
-            _hide_equivalent_deck_aliases({"Client": local, "KelmaSync": server})
-
             try:
                 from kelma_sync_v2.full_diff import _diff_keyed
                 p("Comparing notes…")
@@ -3389,72 +3390,43 @@ def _initial_deck_groups(local_names: list[str], server_names: list[str]) -> lis
     return sorted(groups, key=lambda group: group["display"].casefold())
 
 
-def _hide_equivalent_deck_aliases(manifests: dict[str, dict]) -> int:
-    """Hide deck-path aliases when config and card membership prove equivalence.
+def _prepare_deck_namespace_comparison(manifests: dict[str, dict]) -> int:
+    from kelma_sync_v2.namespace_compare import prepare_deck_namespace_comparison
 
-    A parent-path change must not turn every card into a structural conflict.
-    We only collapse a leaf when every compared source has exactly one such deck,
-    deck config checksums agree, and differently named decks share card logical
-    identities. Ambiguous duplicate leaf names remain visible.
-    """
-    decks_by_source: dict[str, dict[str, list[dict]]] = {}
-    cards_by_source: dict[str, dict[str, set[str]]] = {}
-    for source, manifest in manifests.items():
-        deck_groups: dict[str, list[dict]] = {}
-        for deck in manifest.get("decks", []):
-            deck_groups.setdefault(_deck_leaf(deck.get("name", "")), []).append(deck)
-        decks_by_source[source] = deck_groups
+    return prepare_deck_namespace_comparison(manifests)
 
-        card_groups: dict[str, set[str]] = {}
-        for card in manifest.get("cards", []):
-            deck_name = str(card.get("deck_name", ""))
-            logical = str(
-                card.get("logical_key")
-                or f"{card.get('note_guid', '')}:{int(card.get('ord', 0) or 0)}"
-            )
-            if deck_name and logical:
-                card_groups.setdefault(deck_name.casefold(), set()).add(logical)
-        cards_by_source[source] = card_groups
 
-    if not decks_by_source:
-        return 0
-    common_leaves = set.intersection(
-        *(set(groups) for groups in decks_by_source.values())
-    )
-    hidden: dict[str, set[str]] = {source: set() for source in manifests}
-    collapsed = 0
-    for leaf in common_leaves:
-        items = {
-            source: groups[leaf]
-            for source, groups in decks_by_source.items()
-        }
-        if any(len(values) != 1 for values in items.values()):
-            continue
-        one_each = {source: values[0] for source, values in items.items()}
-        checksums = {str(item.get("checksum", "")) for item in one_each.values()}
-        if len(checksums) != 1 or not next(iter(checksums), ""):
-            continue
-        full_names = {str(item.get("name", "")).casefold() for item in one_each.values()}
-        if len(full_names) > 1:
-            memberships = [
-                cards_by_source[source].get(
-                    str(item.get("name", "")).casefold(), set()
-                )
-                for source, item in one_each.items()
-            ]
-            if not memberships or not set.intersection(*memberships):
-                continue
-        for source, item in one_each.items():
-            hidden[source].add(str(item.get("name", "")).casefold())
-        collapsed += 1
+def _move_local_deck_namespace(col, current_path: str, target_path: str) -> int:
+    """Move one content-bearing deck path locally in one backend operation."""
+    current_deck = col.decks.by_name(current_path)
+    if current_deck is None:
+        raise RuntimeError(f"Local namespace deck not found: {current_path}")
+    card_ids = [
+        int(card_id)
+        for card_id in col.db.list(
+            "SELECT id FROM cards WHERE did=?", int(current_deck["id"])
+        )
+    ]
+    if target_path != current_path and card_ids:
+        target_did = int(col.decks.id(target_path))
+        col.set_deck(card_ids=card_ids, deck_id=target_did)
+    return len(card_ids)
 
-    if collapsed:
-        for source, manifest in manifests.items():
-            manifest["decks"] = [
-                deck for deck in manifest.get("decks", [])
-                if str(deck.get("name", "")).casefold() not in hidden[source]
-            ]
-    return collapsed
+
+def _ensure_kelma_namespace_route(deck_name: str) -> None:
+    """Keep the chosen namespace explicitly in scope without deleting old routes."""
+    cfg = config.get()
+    routing = dict(cfg.get("deck_routing") or {})
+    services = list(routing.get(deck_name) or config.services_for_deck(deck_name))
+    if consts.KELMA not in services:
+        services.insert(0, consts.KELMA)
+    routing[deck_name] = [
+        service for service in consts.SERVICES if service in services
+    ]
+    cfg["deck_routing"] = routing
+    cfg["v2_routing_initialized"] = True
+    cfg["v2_unrouted_decks_local"] = True
+    config.save(cfg)
 
 
 def _save_initial_v2_routing(known_names: set[str], selected_names: set[str]) -> None:
@@ -3847,6 +3819,12 @@ class V2JointStateDialog(QDialog):
         if resource == "cards":
             from kelma_sync_v2.full_diff import card_comparison_fingerprint
             return card_comparison_fingerprint(item)
+        if resource == "decks" and item.get("namespace_group"):
+            return (
+                "namespace",
+                str(item.get("namespace_name", "")).casefold(),
+                item.get("checksum"),
+            )
         return item.get("checksum")
 
     @staticmethod
@@ -3854,6 +3832,8 @@ class V2JointStateDialog(QDialog):
         field = {"notes": "guid", "cards": "logical_key", "notetypes": "notetype_id", "decks": "name"}[resource]
         if resource == "cards":
             return str(item.get(field) or f"{item.get('note_guid', '')}:{int(item.get('ord', 0) or 0)}")
+        if resource == "decks" and item.get("namespace_group"):
+            return f"namespace:{item['namespace_group']}"
         return str(item.get(field, ""))
 
     def _fetch(self) -> None:
@@ -3966,7 +3946,7 @@ class V2JointStateDialog(QDialog):
                     for nt in kelma.get("notetypes", [])
                     if int(nt.get("notetype_id", 0)) in comparison_ntids
                 ]
-                _hide_equivalent_deck_aliases({
+                _prepare_deck_namespace_comparison({
                     "Client": local,
                     "AnkiWeb": ankiweb,
                     "KelmaSync": kelma,
@@ -4050,6 +4030,15 @@ class V2JointStateDialog(QDialog):
         """Choose the uniquely newest copy, but never guess through a conflict."""
         sources = ("Client", "AnkiWeb", "KelmaSync")
         present = [source for source in sources if values[source] is not None]
+        if (
+            resource == "decks"
+            and len(present) == 3
+            and any((values[source] or {}).get("namespace_group") for source in sources)
+        ):
+            return None, (
+                "Namespace mismatch: the same cards are stored under different "
+                "deck paths. Choose the path that all three copies should use."
+            )
         if len(present) == 1 and self._initial_setup:
             # During first setup the user has just chosen this deck after both
             # services were read. Preserve the sole existing copy; never infer
@@ -4109,6 +4098,22 @@ class V2JointStateDialog(QDialog):
         present = [s for s in sources if values[s] is not None]
         missing = [s for s in sources if values[s] is None]
         description = self._resource_description(resource)
+        if resource == "decks" and any(
+            (values[source] or {}).get("namespace_group") for source in sources
+        ):
+            paths = ", ".join(
+                f"{self._source_label(source)}: {(values[source] or {}).get('namespace_name', '(missing)')}"
+                for source in sources
+            )
+            count = max(
+                int((values[source] or {}).get("namespace_card_count", 0) or 0)
+                for source in sources
+            )
+            return (
+                f"The same {count:,} cards are under different deck namespaces. "
+                f"{paths}. Resolve this one deck-path difference; the cards are "
+                "not separate content conflicts."
+            )
         if len(present) == 1:
             return f"Only {self._source_label(present[0])} has this item. It is absent from the other two copies."
         if missing:
@@ -4146,6 +4151,14 @@ class V2JointStateDialog(QDialog):
 
     def _item_label(self, resource: str, key: str, values: dict[str, dict | None]) -> str:
         if resource == "decks":
+            namespace = next(
+                (value for value in values.values() if value and value.get("namespace_group")),
+                None,
+            )
+            if namespace:
+                leaf = str(namespace.get("namespace_name", "")).rsplit("::", 1)[-1]
+                count = int(namespace.get("namespace_card_count", 0) or 0)
+                return f"Deck namespace · {count:,} cards\n{leaf}"
             return f"Deck\n{key}"
         if resource == "notetypes":
             return f"Note type\nID {key}"
@@ -4246,11 +4259,15 @@ class V2JointStateDialog(QDialog):
                             f"Remove this item (match {self._source_label(source)})"
                         )
                     else:
-                        label = {
-                            "Client": "Keep this computer's version",
-                            "AnkiWeb": "Keep AnkiWeb's version",
-                            "KelmaSync": "Keep KelmaSync's version",
-                        }[source]
+                        if resource == "decks" and values[source].get("namespace_group"):
+                            path = str(values[source].get("namespace_name", ""))
+                            label = f"Use deck path: {path}"
+                        else:
+                            label = {
+                                "Client": "Keep this computer's version",
+                                "AnkiWeb": "Keep AnkiWeb's version",
+                                "KelmaSync": "Keep KelmaSync's version",
+                            }[source]
                     if source == suggested:
                         label += " — newest"
                     choice.addItem(label, source)
@@ -4361,6 +4378,12 @@ class V2JointStateDialog(QDialog):
             self._update_apply_state()
             return
         decisions = [(resource, key, str(selected[i])) for i, (resource, key) in enumerate(self._rows)]
+        chosen_namespace_paths = [
+            str((self._sources[resource][source].get(key) or {}).get("namespace_name"))
+            for resource, key, source in decisions
+            if resource == "decks"
+            and (self._sources[resource][source].get(key) or {}).get("namespace_group")
+        ]
         self._kelma_changes = []
         self._ankiweb_changes = []
         for resource, key, source in decisions:
@@ -4371,11 +4394,20 @@ class V2JointStateDialog(QDialog):
             ):
                 target_item = self._sources[resource][target].get(key)
                 if self._fingerprint(resource, chosen) != self._fingerprint(resource, target_item):
-                    changes.append({
+                    change = {
                         "resource": resource,
                         "key": key,
                         "server_item": target_item,
-                    })
+                    }
+                    if resource == "decks" and (chosen or {}).get("namespace_group"):
+                        change.update({
+                            "namespace": True,
+                            "namespace_group": chosen.get("namespace_group"),
+                            "selected_namespace": chosen.get("namespace_name"),
+                            "target_namespace": (target_item or {}).get("namespace_name"),
+                            "namespace_card_count": chosen.get("namespace_card_count", 0),
+                        })
+                    changes.append(change)
         client = self._client
         self.apply_btn.setEnabled(False)
         self.status.setText("Applying your choices to this computer…")
@@ -4399,11 +4431,33 @@ class V2JointStateDialog(QDialog):
             )
             for resource, key, source in ordered:
                 item = self._sources[resource][source].get(key)
+                local_item = self._sources[resource]["Client"].get(key)
+                if resource == "decks" and (item or {}).get("namespace_group"):
+                    target_path = str(item.get("namespace_name") or "")
+                    current_path = str((local_item or {}).get("namespace_name") or "")
+                    if not target_path or not current_path:
+                        raise RuntimeError("Namespace decision is missing a deck path.")
+                    _move_local_deck_namespace(
+                        mw.col, current_path, target_path
+                    )
+                    if source == "KelmaSync":
+                        record = client.get_deck(target_path)
+                    else:
+                        record = anki_local.deck_record(remote, target_path)
+                    if record is None:
+                        raise RuntimeError(
+                            f"Could not read namespace deck {target_path} from {source}."
+                        )
+                    record = dict(record)
+                    record["name"] = target_path
+                    anki_apply.apply_deck(mw.col, record)
+                    continue
                 if item is None:
                     if resource == "notes":
                         anki_apply.delete_note(mw.col, key)
                     elif resource == "decks":
-                        anki_apply.delete_deck(mw.col, key)
+                        local_name = str((local_item or {}).get("name") or key)
+                        anki_apply.delete_deck(mw.col, local_name)
                     elif resource == "notetypes":
                         anki_apply.delete_notetype(mw.col, int(key))
                     elif resource == "cards":
@@ -4415,12 +4469,12 @@ class V2JointStateDialog(QDialog):
                     if resource == "notes": record = client.get_note(key)
                     elif resource == "cards": record = client.get_card(int(item["card_id"]))
                     elif resource == "notetypes": record = client.get_notetype(int(key))
-                    else: record = client.get_deck(key)
+                    else: record = client.get_deck(str(item.get("name") or key))
                 else:
                     if resource == "notes": record = anki_local.note_record(remote, key)
                     elif resource == "cards": record = anki_local.card_record(remote, int(item["card_id"]))
                     elif resource == "notetypes": record = anki_local.notetype_record(remote, int(key))
-                    else: record = anki_local.deck_record(remote, key)
+                    else: record = anki_local.deck_record(remote, str(item.get("name") or key))
                 if record is None:
                     raise RuntimeError(f"Could not read the chosen {resource[:-1]} from {source}.")
                 if resource == "notes": anki_apply.apply_note(mw.col, record)
@@ -4440,6 +4494,9 @@ class V2JointStateDialog(QDialog):
             for choice in self._choices:
                 choice.setEnabled(False)
             self.apply_btn.setEnabled(False)
+            for deck_name in chosen_namespace_paths:
+                if deck_name:
+                    _ensure_kelma_namespace_route(deck_name)
             if not self._kelma_changes:
                 self._mark_badge_synced(consts.KELMA)
             if not self._ankiweb_changes:
@@ -4531,7 +4588,9 @@ class V2JointStateDialog(QDialog):
 
 
 def _v2_compare_or_onboard() -> None:
-    if not config.kelmasync_only() and not config.v2_routing_initialized():
+    if not config.kelmasync_only():
+        # The standalone plugin's comparer must preserve the independent
+        # Client/AnkiWeb/KelmaSync model, including aggregated namespace rows.
         V2JointStateDialog(mw).exec()
     else:
         V2FullDiffDialog(mw).exec()
