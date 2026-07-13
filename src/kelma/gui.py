@@ -3249,6 +3249,7 @@ class V2JointStateDialog(QDialog):
         self._rows: list[tuple[str, str]] = []
         self._row_values: list[dict[str, dict | None]] = []
         self._choices: list[QComboBox] = []
+        self._selected_sources: list[str | None] = []
         self._conflict_indices: list[int] = []
         self._kelma_changes: list[dict] = []
         self._ankiweb_changes: list[dict] = []
@@ -3675,6 +3676,7 @@ class V2JointStateDialog(QDialog):
         self._rows.clear()
         self._row_values.clear()
         self._choices.clear()
+        self._selected_sources.clear()
         self._conflict_indices.clear()
         self._load_note_previews()
         rows = []
@@ -3691,56 +3693,96 @@ class V2JointStateDialog(QDialog):
                     counts["conflicts" if suggested is None else "newest"] += 1
         # Put choices that need attention first; safe newest-wins rows follow.
         rows.sort(key=lambda row: (row[3] is not None, row[0], row[1]))
-        self.table.setRowCount(len(rows))
-        for row, (resource, key, values, suggested, reason) in enumerate(rows):
+        for row, (resource, key, values, suggested, _reason) in enumerate(rows):
             self._rows.append((resource, key))
             self._row_values.append(values)
+            self._selected_sources.append(suggested)
             if suggested is None:
                 self._conflict_indices.append(row)
-            item_cell = QTableWidgetItem(self._item_label(resource, key, values))
-            explanation = self._difference_text(resource, values) + "\n\n" + reason
-            difference_cell = QTableWidgetItem(explanation)
-            self.table.setItem(row, 0, item_cell)
-            self.table.setItem(row, 1, difference_cell)
-            choice = QComboBox()
-            if suggested is None:
-                choice.addItem("Choose a version…", None)
-            for source in ("Client", "AnkiWeb", "KelmaSync"):
-                if values[source] is None:
-                    label = f"Remove this item (match {self._source_label(source)})"
-                else:
-                    label = {
-                        "Client": "Keep this computer's version",
-                        "AnkiWeb": "Keep AnkiWeb's version",
-                        "KelmaSync": "Keep KelmaSync's version",
-                    }[source]
-                if source == suggested:
-                    label += " — newest"
-                choice.addItem(label, source)
-            choice.setCurrentIndex(choice.findData(suggested))
-            choice.currentIndexChanged.connect(self._update_apply_state)
-            self.table.setCellWidget(row, 2, choice)
-            self._choices.append(choice)
-            details = QPushButton("Details…")
-            details.clicked.connect(
-                lambda _=False, r=resource, k=key, v=values: self._show_details(r, k, v)
-            )
-            self.table.setCellWidget(row, 3, details)
-            self.table.resizeRowToContents(row)
+
+        # Creating a combo box + button for tens of thousands of differences
+        # exhausts Qt and makes a fresh install look crashed. Keep every choice
+        # in the model above, but render only a bounded attention-first window.
+        cap = 500
+        shown = rows[:cap]
+        self.table.setUpdatesEnabled(False)
+        self.table.setRowCount(len(shown))
+        try:
+            for row, (resource, key, values, suggested, reason) in enumerate(shown):
+                item_cell = QTableWidgetItem(self._item_label(resource, key, values))
+                explanation = self._difference_text(resource, values) + "\n\n" + reason
+                difference_cell = QTableWidgetItem(explanation)
+                self.table.setItem(row, 0, item_cell)
+                self.table.setItem(row, 1, difference_cell)
+                choice = QComboBox()
+                if suggested is None:
+                    choice.addItem("Choose a version…", None)
+                for source in ("Client", "AnkiWeb", "KelmaSync"):
+                    if values[source] is None:
+                        label = (
+                            f"Remove this item (match {self._source_label(source)})"
+                        )
+                    else:
+                        label = {
+                            "Client": "Keep this computer's version",
+                            "AnkiWeb": "Keep AnkiWeb's version",
+                            "KelmaSync": "Keep KelmaSync's version",
+                        }[source]
+                    if source == suggested:
+                        label += " — newest"
+                    choice.addItem(label, source)
+                choice.setCurrentIndex(choice.findData(suggested))
+                choice.currentIndexChanged.connect(
+                    lambda _index, r=row, widget=choice: self._set_choice(
+                        r, widget.currentData()
+                    )
+                )
+                self.table.setCellWidget(row, 2, choice)
+                self._choices.append(choice)
+                details = QPushButton("Details…")
+                details.clicked.connect(
+                    lambda _=False, r=resource, k=key, v=values: self._show_details(
+                        r, k, v
+                    )
+                )
+                self.table.setCellWidget(row, 3, details)
+                self.table.resizeRowToContents(row)
+        finally:
+            self.table.setUpdatesEnabled(True)
         self.batch_box.setVisible(bool(self._conflict_indices))
         if rows:
-            summary = ", ".join(f"{count} {resource}" for resource, count in counts.items() if resource in ("notes", "cards", "notetypes", "decks"))
+            summary = ", ".join(
+                f"{count} {resource}"
+                for resource, count in counts.items()
+                if resource in ("notes", "cards", "notetypes", "decks")
+            )
             conflict_text = (
-                f"{counts['conflicts']} conflict(s) need your choice. " if counts["conflicts"] else ""
+                f"{counts['conflicts']} conflict(s) need your choice. "
+                if counts["conflicts"]
+                else ""
+            )
+            shown_text = (
+                f" Showing the first {len(shown):,}; batch choices apply to all."
+                if len(rows) > cap
+                else ""
             )
             self.status.setText(
-                f"Found {len(rows)} difference(s): {summary}. "
-                f"{counts['newest']} newest version(s) were selected automatically. {conflict_text}"
+                f"Found {len(rows):,} difference(s): {summary}. "
+                f"{counts['newest']} newest version(s) were selected automatically. "
+                f"{conflict_text}{shown_text}"
             )
             self._update_apply_state()
         else:
-            self.status.setText("Everything matches across this computer, AnkiWeb, and KelmaSync. You are already up to date.")
+            self.status.setText(
+                "Everything matches across this computer, AnkiWeb, and KelmaSync. "
+                "You are already up to date."
+            )
             self.apply_btn.setEnabled(False)
+
+    def _set_choice(self, row: int, source: str | None) -> None:
+        if 0 <= row < len(self._selected_sources):
+            self._selected_sources[row] = source
+        self._update_apply_state()
 
     def _batch_choose(self, source: str) -> None:
         changed = 0
@@ -3768,18 +3810,18 @@ class V2JointStateDialog(QDialog):
                 # an explicit per-row choice so one click cannot erase data.
                 skipped += 1
                 continue
-            index = self._choices[row].findData(selected)
-            if index >= 0:
-                self._choices[row].setCurrentIndex(index)
-                changed += 1
-            else:
-                skipped += 1
+            self._selected_sources[row] = selected
+            if row < len(self._choices):
+                index = self._choices[row].findData(selected)
+                if index >= 0:
+                    self._choices[row].setCurrentIndex(index)
+            changed += 1
         self._update_apply_state()
         suffix = f" {skipped} skipped to avoid deletion or an ambiguous tie." if skipped else ""
         self.status.setText(f"Batch choice applied to {changed} conflict(s).{suffix}")
 
     def _update_apply_state(self, _index: int = -1) -> None:
-        unresolved = sum(choice.currentData() is None for choice in self._choices)
+        unresolved = sum(source is None for source in self._selected_sources)
         self.apply_btn.setEnabled(bool(self._choices) and unresolved == 0)
         if unresolved:
             self.apply_btn.setText(f"Choose {unresolved} conflict(s) to continue")
@@ -3790,7 +3832,7 @@ class V2JointStateDialog(QDialog):
         _mark_service_synced_for_badges(service)
 
     def _apply(self) -> None:
-        selected = [choice.currentData() for choice in self._choices]
+        selected = list(self._selected_sources)
         if any(source is None for source in selected):
             self.status.setText("Choose a version for every conflict before applying.")
             self._update_apply_state()
