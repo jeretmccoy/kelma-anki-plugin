@@ -53,13 +53,12 @@ def get() -> dict[str, Any]:
     cfg.setdefault("v2_last_server_time", "")
     cfg.setdefault("v2_allow_large_deletes", False)
     # A fresh Anki add-on install must not interpret an empty routing map as
-    # "publish every Anki deck to KelmaSync". Existing installations that have
-    # explicit routes or a completed v2 sync are already initialized; genuinely
-    # fresh profiles go through the AnkiWeb → KelmaSync → deck-picker flow.
+    # "publish every Anki deck to KelmaSync". Only an explicit routing map (or
+    # the new persisted flag) counts as initialized; an old sync timestamp does
+    # not make the unsafe implicit-all scope explicit. Such profiles go through
+    # the AnkiWeb → KelmaSync → deck-picker flow once after upgrading.
     if not cfg.get("v2_routing_initialized", False):
-        cfg["v2_routing_initialized"] = bool(
-            cfg.get("deck_routing") or cfg.get("v2_last_server_time")
-        )
+        cfg["v2_routing_initialized"] = bool(cfg.get("deck_routing"))
     cfg.setdefault("v2_unrouted_decks_local", False)
     return cfg
 
