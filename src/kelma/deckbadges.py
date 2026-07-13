@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import os
 import re
-import threading
 import time
 
 from anki.media import media_paths_from_col_path
@@ -22,8 +21,9 @@ from . import config, consts, features, paths, state
 
 _installed = False
 
-# Per-cloud on-disk size: computed in the background (walking media is slow) and
-# cached, so it never blocks the deck-list render.
+# Per-cloud size: exact authenticated server usage for KelmaSync, and local
+# collection/media bytes for native AnkiWeb. Computed in the background and
+# cached so deck-list rendering never performs network or filesystem work.
 _SIZE_TTL = 300
 _size_cache: dict[str, tuple[float, int]] = {}
 _size_running: set[str] = set()
@@ -175,16 +175,39 @@ def _ensure_size(service: str) -> None:
     _size_running.add(service)
     shadow_path = paths.shadow_path(service)  # resolve on the main thread
     col_path = str(getattr(mw.col, "path", "") or "")
+    cfg = config.get()
+    endpoint = str(cfg.get("v2_url") or consts.DEFAULT_V2_URL)
+    token = str(cfg.get("v2_token") or "")
 
-    def run() -> None:
+    def work() -> int:
+        if service == consts.KELMA and token:
+            # This badge describes cloud storage, not the size of the entire
+            # local Anki profile. Ask KelmaSync for its exact account-wide total
+            # (media blobs + canonical content rows).
+            from .kelma_sync_v2.client import V2Client
+
+            return int(
+                V2Client(endpoint, token=token, timeout=20)
+                .usage()
+                .get("used_bytes", 0)
+            )
+        if service == consts.ANKIWEB:
+            # Native AnkiWeb sync covers the real collection, not a v1 shadow.
+            return _compute_size("", col_path)
+        return _compute_size(shadow_path, col_path)
+
+    def done(future) -> None:
         try:
-            size = _compute_size(shadow_path, col_path)
+            size = int(future.result())
+        except Exception as err:  # noqa: BLE001
+            print(f"Kelma badge size refresh failed ({service}): {err}")
+        else:
             _size_cache[service] = (time.time(), size)
-            mw.taskman.run_on_main(_refresh_deck_list)
+            _refresh_deck_list()
         finally:
             _size_running.discard(service)
 
-    threading.Thread(target=run, daemon=True).start()
+    mw.taskman.run_in_background(work, done, uses_collection=False)
 
 
 def invalidate_sizes() -> None:

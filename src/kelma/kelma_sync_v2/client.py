@@ -75,6 +75,15 @@ class V2Client:
             path += "?" + urllib.parse.urlencode({"since": since})
         return self._json("GET", path, None)
 
+    def usage(self) -> dict[str, int]:
+        """Return exact account-wide bytes currently stored by KelmaSync."""
+        data = self._json("GET", "/v2/usage", None)
+        return {
+            "used_bytes": int(data.get("used_bytes", 0) or 0),
+            "media_bytes": int(data.get("media_bytes", 0) or 0),
+            "content_bytes": int(data.get("content_bytes", 0) or 0),
+        }
+
     # ---------------------------------------------------------------- notes --
 
     def get_note(self, guid: str) -> dict[str, Any]:
