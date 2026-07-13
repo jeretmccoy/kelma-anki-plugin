@@ -6,9 +6,8 @@ from __future__ import annotations
 import difflib
 import json
 import re
-import shutil
 import sys
-import tempfile
+import threading
 import time
 from collections import Counter
 from concurrent.futures import Future
@@ -3237,13 +3236,15 @@ def _v2_old_staged_menu() -> None:
 class V2JointStateDialog(QDialog):
     """One workspace for fetching, choosing, and publishing all sync sources."""
 
+    _status_signal = pyqtSignal(str)
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("KelmaSync · Review changes")
         self.resize(1180, 760)
         self._client = _v2_client_or_login()
-        self._temp_dir: str | None = None
         self._remote_col = None
+        self._fetching = False
         self._sources: dict[str, dict[str, dict]] = {}
         self._rows: list[tuple[str, str]] = []
         self._row_values: list[dict[str, dict | None]] = []
@@ -3312,10 +3313,11 @@ class V2JointStateDialog(QDialog):
         actions.addWidget(self.apply_btn)
         actions.addWidget(self.publish_btn)
         actions.addStretch()
-        close = QPushButton("Close")
-        close.clicked.connect(self.reject)
-        actions.addWidget(close)
+        self.close_btn = QPushButton("Close")
+        self.close_btn.clicked.connect(self.reject)
+        actions.addWidget(self.close_btn)
         layout.addLayout(actions)
+        self._status_signal.connect(self.status.setText)
 
         if self._client is None or (not self._deck_names and self._deck_names is not None):
             self.status.setText("Sign in and choose at least one KelmaSync deck before reviewing changes.")
@@ -3324,14 +3326,18 @@ class V2JointStateDialog(QDialog):
             self._fetch()
 
     def reject(self) -> None:
+        if self._fetching:
+            self.status.setText(
+                "The independent AnkiWeb copy is still downloading. Its progress "
+                "is shown above; this computer's collection is not being changed."
+            )
+            return
         if self._remote_col is not None:
             try:
                 self._remote_col.close()
             except Exception:  # noqa: BLE001
                 pass
             self._remote_col = None
-        if self._temp_dir:
-            shutil.rmtree(self._temp_dir, ignore_errors=True)
         super().reject()
 
     @staticmethod
@@ -3366,11 +3372,15 @@ class V2JointStateDialog(QDialog):
 
     def _fetch(self) -> None:
         self.apply_btn.setEnabled(False)
+        self.close_btn.setEnabled(False)
+        self._fetching = True
         self.status.setText("Checking AnkiWeb without changing this computer…")
         client = self._client
         deck_names = self._deck_names
         auth = mw.pm.sync_auth()
         if not auth:
+            self._fetching = False
+            self.close_btn.setEnabled(True)
             self.status.setText("Sign in to AnkiWeb before reviewing all three copies.")
             return
 
@@ -3379,47 +3389,120 @@ class V2JointStateDialog(QDialog):
             from kelma_sync_v2 import anki_local
             from kelma_sync_v2.content_sync import _scope_server_manifest_to_decks
 
-            temp_dir = tempfile.mkdtemp(prefix="kelma-joint-state-")
-            temp_path = str(Path(temp_dir) / "collection.anki2")
-            remote = Collection(temp_path)
-            remote_auth = type(auth)()
-            remote_auth.CopyFrom(auth)
-            handshake = remote.sync_collection(remote_auth, False)
-            if handshake.new_endpoint:
-                remote_auth.endpoint = handshake.new_endpoint
-            remote.close_for_full_sync()
-            remote.full_upload_or_download(
-                auth=remote_auth,
-                server_usn=handshake.server_media_usn,
-                upload=False,
+            # Keep an independent cache beside the main collection. It is never
+            # applied to mw.col. First use may require a full download; later
+            # comparisons use AnkiWeb's normal incremental sync against this cache.
+            cache_path = str(Path(mw.col.path).with_name("kelma_ankiweb_compare.anki2"))
+            remote = Collection(cache_path)
+            completed = False
+            stop_monitor = threading.Event()
+            started = time.monotonic()
+
+            def monitor() -> None:
+                while not stop_monitor.wait(0.25):
+                    elapsed = time.monotonic() - started
+                    try:
+                        current = remote.latest_progress()
+                        if current.HasField("full_sync"):
+                            value = current.full_sync
+                            if value.total:
+                                pct = min(100, int(value.transferred * 100 / value.total))
+                                text = (
+                                    "Downloading independent AnkiWeb copy… "
+                                    f"{pct}% ({value.transferred / (1024 * 1024):.1f} / "
+                                    f"{value.total / (1024 * 1024):.1f} MB)"
+                                )
+                            else:
+                                text = f"Downloading independent AnkiWeb copy… {elapsed:.0f}s"
+                        elif current.HasField("normal_sync"):
+                            stage = current.normal_sync.stage or "Checking changes"
+                            text = f"AnkiWeb cache: {stage}… {elapsed:.0f}s"
+                        else:
+                            text = f"Checking independent AnkiWeb copy… {elapsed:.0f}s"
+                    except Exception:  # noqa: BLE001
+                        text = f"Checking independent AnkiWeb copy… {elapsed:.0f}s"
+                    self._status_signal.emit(text)
+
+            monitor_thread = threading.Thread(
+                target=monitor, name="kelma-ankiweb-compare-progress", daemon=True
             )
-            remote.reopen(after_full_sync=True)
-            ankiweb = anki_local.local_manifest(remote, deck_names=deck_names)
-            local = anki_local.local_manifest(mw.col, deck_names=deck_names)
-            kelma = _scope_server_manifest_to_decks(client, client.manifest(), deck_names)
-            # Only compare notetypes used by scoped notes on local or AnkiWeb.
-            # Server note manifests don't carry notetype_id, so derive the
-            # comparison set from local + AnkiWeb and filter all three sides.
-            comparison_ntids = {
-                int(nt["notetype_id"])
-                for nt in local["notetypes"] + ankiweb["notetypes"]
-            }
-            local["notetypes"] = [nt for nt in local["notetypes"] if int(nt["notetype_id"]) in comparison_ntids]
-            ankiweb["notetypes"] = [nt for nt in ankiweb["notetypes"] if int(nt["notetype_id"]) in comparison_ntids]
-            kelma["notetypes"] = [nt for nt in kelma.get("notetypes", []) if int(nt.get("notetype_id", 0)) in comparison_ntids]
-            return temp_dir, remote, local, ankiweb, kelma
+            monitor_thread.start()
+            try:
+                remote_auth = type(auth)()
+                remote_auth.CopyFrom(auth)
+                handshake = remote.sync_collection(remote_auth, False)
+                if handshake.new_endpoint:
+                    remote_auth.endpoint = handshake.new_endpoint
+                if handshake.required != handshake.NO_CHANGES:
+                    self._status_signal.emit(
+                        "AnkiWeb requires an independent full download; this computer's "
+                        "collection remains untouched."
+                    )
+                    remote.close_for_full_sync()
+                    remote.full_upload_or_download(
+                        auth=remote_auth,
+                        server_usn=handshake.server_media_usn,
+                        upload=False,
+                    )
+                    remote.reopen(after_full_sync=True)
+                self._status_signal.emit("Reading independent AnkiWeb snapshot…")
+                ankiweb = anki_local.local_manifest(remote, deck_names=deck_names)
+                local = anki_local.local_manifest(mw.col, deck_names=deck_names)
+                self._status_signal.emit("Fetching KelmaSync snapshot…")
+                kelma = _scope_server_manifest_to_decks(
+                    client, client.manifest(), deck_names
+                )
+                comparison_ntids = {
+                    int(nt["notetype_id"])
+                    for nt in local["notetypes"] + ankiweb["notetypes"]
+                }
+                local["notetypes"] = [
+                    nt
+                    for nt in local["notetypes"]
+                    if int(nt["notetype_id"]) in comparison_ntids
+                ]
+                ankiweb["notetypes"] = [
+                    nt
+                    for nt in ankiweb["notetypes"]
+                    if int(nt["notetype_id"]) in comparison_ntids
+                ]
+                kelma["notetypes"] = [
+                    nt
+                    for nt in kelma.get("notetypes", [])
+                    if int(nt.get("notetype_id", 0)) in comparison_ntids
+                ]
+                completed = True
+                return remote, local, ankiweb, kelma
+            finally:
+                stop_monitor.set()
+                monitor_thread.join(timeout=1)
+                if not completed:
+                    try:
+                        remote.close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
         def done(future: Future) -> None:
+            self._fetching = False
             try:
-                self._temp_dir, self._remote_col, local, ankiweb, kelma = future.result()
+                self.close_btn.setEnabled(True)
+            except RuntimeError:
+                return
+            try:
+                self._remote_col, local, ankiweb, kelma = future.result()
             except Exception as err:  # noqa: BLE001
                 self.status.setText(f"Could not compare the three copies: {err}")
                 return
             for resource in ("notes", "cards", "notetypes", "decks"):
                 self._sources[resource] = {}
-                for name, manifest in (("Client", local), ("AnkiWeb", ankiweb), ("KelmaSync", kelma)):
+                for name, manifest in (
+                    ("Client", local),
+                    ("AnkiWeb", ankiweb),
+                    ("KelmaSync", kelma),
+                ):
                     self._sources[resource][name] = {
-                        self._key(resource, item): item for item in manifest.get(resource, [])
+                        self._key(resource, item): item
+                        for item in manifest.get(resource, [])
                     }
             self._populate()
 
