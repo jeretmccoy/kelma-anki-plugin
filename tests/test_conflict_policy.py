@@ -38,9 +38,40 @@ class ConflictPolicyTest(unittest.TestCase):
         }
         self.assertGreater(modified_timestamp(item), 0)
 
-    def test_tied_or_unknown_times_remain_ambiguous(self) -> None:
+    def test_offsetless_legacy_time_is_always_utc(self) -> None:
+        naive = {"modified_at": "2026-07-14T10:00:00"}
+        utc = {"modified_at": "2026-07-14T10:00:00Z"}
+        offset = {"modified_at": "2026-07-14T06:00:00-04:00"}
+        self.assertEqual(modified_timestamp(naive), modified_timestamp(utc))
+        self.assertEqual(modified_timestamp(offset), modified_timestamp(utc))
+
+    def test_future_local_clock_cannot_overwrite_server(self) -> None:
+        local = {"modified_at": "2026-07-14T16:00:00Z"}
+        server = {
+            "client_modified_at": "2026-07-14T11:59:00Z",
+            "modified_at": "2026-07-14T11:59:30Z",
+        }
+        self.assertEqual(
+            newest_side(local, server, utc_now="2026-07-14T12:00:00Z"),
+            "server",
+        )
+
+    def test_future_server_source_uses_trusted_receipt_time(self) -> None:
+        local = {"modified_at": "2026-07-14T11:00:00Z"}
+        server = {
+            "client_modified_at": "2026-07-14T16:00:00Z",
+            "modified_at": "2026-07-14T11:30:00Z",
+        }
+        self.assertEqual(
+            newest_side(local, server, utc_now="2026-07-14T12:00:00Z"),
+            "server",
+        )
+
+    def test_tied_unknown_or_subsecond_times_remain_ambiguous(self) -> None:
         stamp = {"modified_at": "2026-07-14T10:00:00Z"}
+        subsecond = {"modified_at": "2026-07-14T10:00:00.900Z"}
         self.assertIsNone(newest_side(stamp, stamp))
+        self.assertIsNone(newest_side(stamp, subsecond))
         self.assertIsNone(newest_side({}, stamp))
 
 

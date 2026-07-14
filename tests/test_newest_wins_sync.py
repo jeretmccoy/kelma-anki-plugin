@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import unittest
@@ -49,6 +50,22 @@ class FakeClient:
 
 
 class NewestWinsSyncTest(unittest.TestCase):
+    def test_anki_mod_is_serialized_as_explicit_utc(self) -> None:
+        self.assertEqual(
+            anki_local.iso_from_anki_mod(1784044800),
+            "2026-07-14T16:00:00Z",
+        )
+
+    def test_future_server_source_is_not_written_into_local_mod(self) -> None:
+        record = {
+            "client_modified_at": "2026-07-14T16:00:00Z",
+            "modified_at": "2026-07-14T12:00:00Z",
+        }
+        expected = int(
+            datetime.fromisoformat("2026-07-14T12:00:00+00:00").timestamp()
+        )
+        self.assertEqual(anki_apply._source_modified_seconds(record), expected)
+
     def test_server_newer_note_is_pulled_without_conflict(self) -> None:
         local = [{
             "guid": "g1", "checksum": "local",
@@ -175,6 +192,38 @@ class NewestWinsSyncTest(unittest.TestCase):
             )
         self.assertEqual(result.pulled, 1)
         self.assertEqual(applied, [2])
+
+    def test_card_generated_by_upstream_note_pull_cannot_overwrite_server(self) -> None:
+        # Anki gives a newly generated local card the current time (12:00), but
+        # the corresponding upstream card was uploaded earlier (11:00). The
+        # current local timestamp is generation bookkeeping, not a local edit.
+        local = [{
+            "logical_key": "g1:0", "card_id": 1, "checksum": "same",
+            "modified_at": "2026-07-14T12:00:00Z",
+        }]
+        server = {
+            "server_time": "2026-07-14T12:00:01Z",
+            "cards": [{
+                "logical_key": "g1:0", "card_id": 2, "checksum": "same",
+                "client_modified_at": "2026-07-14T11:00:00Z",
+            }],
+        }
+        client = FakeClient(pulled={"cards": [{"card_id": 2}]})
+        with (
+            patch.object(anki_local, "card_manifest", return_value=local),
+            patch.object(anki_apply, "apply_card") as apply_card,
+        ):
+            result = card_sync.sync_cards_once(
+                object(),
+                client,
+                server_manifest=server,
+                newest_wins=True,
+                server_authoritative_keys={"g1:0"},
+            )
+        self.assertEqual(result.pulled, 1)
+        self.assertEqual(result.pushed, 0)
+        self.assertEqual(client.push_requests, [])
+        apply_card.assert_called_once_with(ANY, {"card_id": 2})
 
 
 class DesktopModeTest(unittest.TestCase):
