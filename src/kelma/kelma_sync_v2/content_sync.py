@@ -277,6 +277,7 @@ def sync_content_once(
     deck_names: list[str] | None = None,
     apply_note_pulls: bool = True,
     allow_large_deletes: bool = False,
+    newest_wins: bool = False,
     progress=None,
 ) -> ContentSyncResult:
     """Run one content sync pass.
@@ -433,6 +434,7 @@ def sync_content_once(
             progress=progress,
             deck_names=deck_names,
             prefer_server=fresh_restore,
+            newest_wins=newest_wins,
         )
     except DeckSyncConflict as e:
         raise ContentSyncConflict("deck", e.conflicts) from e
@@ -447,6 +449,7 @@ def sync_content_once(
             progress=progress,
             notetype_ids=compared_notetype_ids,
             prefer_server=fresh_restore,
+            newest_wins=newest_wins,
         )
     except NotetypeSyncConflict as e:
         raise ContentSyncConflict("notetype", e.conflicts) from e
@@ -461,6 +464,7 @@ def sync_content_once(
             deck_name=deck_name,
             deck_names=deck_names,
             server_manifest=manifest,
+            newest_wins=newest_wins,
             progress=progress,
         )
     except NoteSyncConflict as e:
@@ -475,6 +479,7 @@ def sync_content_once(
             progress=progress,
             deck_names=deck_names,
             prefer_server=fresh_restore,
+            newest_wins=newest_wins,
         )
     except CardSyncConflict as e:
         raise ContentSyncConflict("card", e.conflicts) from e
