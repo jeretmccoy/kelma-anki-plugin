@@ -86,6 +86,9 @@ class FakeCollection:
         self.decks = FakeDecks()
         self.crt = 1_700_000_000
 
+    def save(self) -> None:
+        pass
+
 
 class FakeClient:
     def __init__(self, remote_review: dict) -> None:
@@ -131,6 +134,30 @@ class ReviewHistorySyncTest(unittest.TestCase):
         )
         self.assertEqual(result.skipped, 1)
         self.assertEqual(result.conflicts, [])
+
+    def test_dual_sync_marks_downloaded_history_pending_for_ankiweb(self) -> None:
+        col = FakeCollection()
+        remote = {
+            "review_id": 1002,
+            "source_card_id": 999,
+            "note_guid": "g1",
+            "card_ord": 0,
+            "deck_name": "Deck",
+            "ease": 3,
+            "interval": 5,
+            "last_interval": 1,
+            "factor": 2500,
+            "taken_millis": 1000,
+            "review_kind": 1,
+        }
+        checksum = review_checksum("g1", 0, 3, 5, 1, 2500, 1000, 1)
+        sync_reviews_once(
+            col,
+            FakeClient(remote),
+            {"reviews": [{"review_id": 1002, "checksum": checksum}], "study_days": []},
+            clear_pending_usn=False,
+        )
+        self.assertEqual(col.db.scalar("SELECT usn FROM revlog WHERE id=1002"), -1)
 
     def test_orphan_source_id_never_attaches_to_an_unrelated_card(self) -> None:
         col = FakeCollection()

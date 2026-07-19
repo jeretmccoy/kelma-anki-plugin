@@ -3655,6 +3655,8 @@ class V2JointStateDialog(QDialog):
         self._conflict_indices: list[int] = []
         self._kelma_changes: list[dict] = []
         self._ankiweb_changes: list[dict] = []
+        self._reviews_need_ankiweb = False
+        self._review_summary = ""
         self._note_previews: dict[str, str] = {}
         self._deck_names: list[str] | None = None
 
@@ -3925,7 +3927,11 @@ class V2JointStateDialog(QDialog):
                                 text = f"Downloading independent AnkiWeb copy… {elapsed:.0f}s"
                         elif current.HasField("normal_sync"):
                             stage = current.normal_sync.stage or "Checking changes"
-                            text = f"AnkiWeb cache: {stage}… {elapsed:.0f}s"
+                            text = (
+                                f"AnkiWeb cache: {stage} across the full AnkiWeb "
+                                f"collection… {elapsed:.0f}s. Large first refreshes can "
+                                "take several minutes; this computer remains untouched."
+                            )
                         else:
                             text = f"Checking independent AnkiWeb copy… {elapsed:.0f}s"
                     except Exception:  # noqa: BLE001
@@ -4430,10 +4436,11 @@ class V2JointStateDialog(QDialog):
             self._update_apply_state()
         else:
             self.status.setText(
-                "Everything matches across this computer, AnkiWeb, and KelmaSync. "
-                "You are already up to date."
+                "Notes, cards, note types, and decks match. Press below to synchronize "
+                "review history and daily study limits."
             )
-            self.apply_btn.setEnabled(False)
+            self.apply_btn.setText("Sync review history and daily limits")
+            self.apply_btn.setEnabled(True)
 
     def _set_choice(self, row: int, source: str | None) -> None:
         if 0 <= row < len(self._selected_sources):
@@ -4477,12 +4484,16 @@ class V2JointStateDialog(QDialog):
         self.status.setText(f"Batch choice applied to {changed} conflict(s).{suffix}")
 
     def _update_apply_state(self, _index: int = -1) -> None:
+        if not self._rows:
+            self.apply_btn.setText("Sync review history and daily limits")
+            self.apply_btn.setEnabled(True)
+            return
         unresolved = sum(source is None for source in self._selected_sources)
-        self.apply_btn.setEnabled(bool(self._choices) and unresolved == 0)
+        self.apply_btn.setEnabled(unresolved == 0)
         if unresolved:
             self.apply_btn.setText(f"Choose {unresolved} conflict(s) to continue")
         else:
-            self.apply_btn.setText("Apply choices to this computer")
+            self.apply_btn.setText("Apply choices and sync review history")
 
     def _mark_badge_synced(self, service: str) -> None:
         _mark_service_synced_for_badges(service)
@@ -4599,10 +4610,47 @@ class V2JointStateDialog(QDialog):
                 else: anki_apply.apply_deck(mw.col, record)
             remote.close()
             self._remote_col = None
-            return len(changed)
+
+            # Review rows are immutable and daily counters merge monotonically,
+            # so they do not need per-item source choices. The standalone
+            # three-way workspace previously omitted this phase entirely.
+            self._status_signal.emit(
+                "Synchronizing complete Kelma review history and daily limits…"
+            )
+            from kelma_sync_v2.review_sync import sync_reviews_once
+
+            review_manifest = client.manifest()
+            deck_names = self._deck_names
+            if deck_names is not None:
+                allowed = set(deck_names)
+
+                def in_scope(name: str) -> bool:
+                    return name in allowed or any(
+                        name.startswith(parent + "::") for parent in allowed
+                    )
+
+                review_manifest = dict(review_manifest)
+                review_manifest["reviews"] = [
+                    item for item in review_manifest.get("reviews", [])
+                    if in_scope(str(item.get("deck_name", "")))
+                ]
+                review_manifest["study_days"] = [
+                    item for item in review_manifest.get("study_days", [])
+                    if in_scope(str(item.get("deck_name", "")))
+                ]
+            reviews = sync_reviews_once(
+                mw.col,
+                client,
+                review_manifest,
+                deck_names=deck_names,
+                clear_pending_usn=False,
+                progress=self._status_signal.emit,
+            )
+            return len(changed), reviews
 
         def done(future: Future) -> None:
-            try: count = future.result()
+            try:
+                count, reviews = future.result()
             except Exception as err:  # noqa: BLE001
                 self.status.setText(f"Could not apply the choices to this computer: {err}")
                 self._update_apply_state()
@@ -4613,20 +4661,32 @@ class V2JointStateDialog(QDialog):
             for deck_name in chosen_namespace_paths:
                 if deck_name:
                     _ensure_kelma_namespace_route(deck_name)
+            self._reviews_need_ankiweb = reviews.pulled > 0
+            self._review_summary = (
+                f"Reviews: {reviews.pulled} downloaded, {reviews.pushed} uploaded; "
+                f"daily limits: {reviews.study_days_applied} applied."
+            )
             if not self._kelma_changes:
                 self._mark_badge_synced(consts.KELMA)
-            if not self._ankiweb_changes:
+            if not self._ankiweb_changes and not self._reviews_need_ankiweb:
                 self._mark_badge_synced(consts.ANKIWEB)
             pending = []
             if self._kelma_changes:
                 pending.append(f"{len(self._kelma_changes)} for KelmaSync")
             if self._ankiweb_changes:
-                pending.append(f"{len(self._ankiweb_changes)} for AnkiWeb")
+                pending.append(f"{len(self._ankiweb_changes)} content change(s) for AnkiWeb")
+            if self._reviews_need_ankiweb:
+                pending.append(f"{reviews.pulled} review row(s) for AnkiWeb")
             pending_text = ", ".join(pending) if pending else "none"
             self.status.setText(
-                f"Applied {count} change(s) to this computer. Changes still to publish: {pending_text}."
+                f"Applied {count} content change(s). {self._review_summary} "
+                f"Changes still to publish: {pending_text}."
             )
-            if self._kelma_changes or self._ankiweb_changes:
+            if (
+                self._kelma_changes
+                or self._ankiweb_changes
+                or self._reviews_need_ankiweb
+            ):
                 self.publish_btn.setEnabled(True)
                 self.publish_btn.setDefault(True)
             else:
@@ -4638,14 +4698,22 @@ class V2JointStateDialog(QDialog):
         self.publish_btn.setEnabled(False)
 
         def prepare_ankiweb() -> None:
-            if not self._ankiweb_changes:
+            if not self._ankiweb_changes and not self._reviews_need_ankiweb:
                 self._mark_badge_synced(consts.ANKIWEB)
                 self.status.setText("Done — this computer, AnkiWeb, and KelmaSync now have the chosen result.")
                 self.publish_btn.setText("Published everywhere ✓")
                 return
-            self.status.setText(f"Preparing {len(self._ankiweb_changes)} selected change(s) for AnkiWeb…")
+            review_text = (
+                f" and {self._review_summary}" if self._reviews_need_ankiweb else ""
+            )
+            self.status.setText(
+                f"Preparing {len(self._ankiweb_changes)} selected content change(s)"
+                f"{review_text} for AnkiWeb…"
+            )
 
             def work():
+                if not self._ankiweb_changes:
+                    return 0
                 from kelma_sync_v2.canonical_sync import mark_selected_state_for_ankiweb
                 return mark_selected_state_for_ankiweb(mw.col, self._ankiweb_changes)
 
@@ -4660,6 +4728,7 @@ class V2JointStateDialog(QDialog):
 
                 def synced(ok: bool, text: str) -> None:
                     if ok:
+                        self._reviews_need_ankiweb = False
                         self.status.setText("Done — this computer, AnkiWeb, and KelmaSync now have the chosen result.")
                         self.publish_btn.setText("Published everywhere ✓")
                     else:
