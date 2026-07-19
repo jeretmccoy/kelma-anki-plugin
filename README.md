@@ -22,7 +22,7 @@ that service, and:
 3. **pulls** the shadow's decks back into the master (newest-wins).
 
 Reconciliation uses Anki's own package import/export with `If Newer`, so merging
-(by note GUID, with scheduling + media) reuses Anki's battle-tested logic instead
+(by note GUID, with scheduling + full review history + media) reuses Anki's battle-tested logic instead
 of a hand-rolled merge. **Deletions** are propagated separately by diffing stable
 note GUIDs against the last converged sync snapshot.
 
