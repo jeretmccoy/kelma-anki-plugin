@@ -3657,6 +3657,7 @@ class V2JointStateDialog(QDialog):
         self._ankiweb_changes: list[dict] = []
         self._reviews_need_ankiweb = False
         self._review_summary = ""
+        self._pending_study_signature = ""
         self._note_previews: dict[str, str] = {}
         self._deck_names: list[str] | None = None
 
@@ -4638,19 +4639,50 @@ class V2JointStateDialog(QDialog):
                     item for item in review_manifest.get("study_days", [])
                     if in_scope(str(item.get("deck_name", "")))
                 ]
+            study_values = [
+                {
+                    key: item.get(key, 0)
+                    for key in (
+                        "day",
+                        "deck_name",
+                        "new_studied",
+                        "review_studied",
+                        "learning_studied",
+                        "milliseconds_studied",
+                    )
+                }
+                for item in review_manifest.get("study_days", [])
+            ]
+            study_values.sort(key=lambda item: (item["deck_name"], item["day"]))
+            study_signature = (
+                hashlib.sha256(
+                    json.dumps(
+                        study_values,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if study_values
+                else ""
+            )
+            previous_study_signature = str(
+                config.get().get("v2_ankiweb_study_signature", "") or ""
+            )
             reviews = sync_reviews_once(
                 mw.col,
                 client,
                 review_manifest,
                 deck_names=deck_names,
                 clear_pending_usn=False,
+                mark_study_days_pending=bool(study_signature)
+                and study_signature != previous_study_signature,
                 progress=self._status_signal.emit,
             )
-            return len(changed), reviews
+            return len(changed), reviews, study_signature
 
         def done(future: Future) -> None:
             try:
-                count, reviews = future.result()
+                count, reviews, study_signature = future.result()
             except Exception as err:  # noqa: BLE001
                 self.status.setText(f"Could not apply the choices to this computer: {err}")
                 self._update_apply_state()
@@ -4661,10 +4693,16 @@ class V2JointStateDialog(QDialog):
             for deck_name in chosen_namespace_paths:
                 if deck_name:
                     _ensure_kelma_namespace_route(deck_name)
-            self._reviews_need_ankiweb = reviews.pulled > 0
+            self._pending_study_signature = (
+                study_signature if reviews.study_days_marked_pending else ""
+            )
+            self._reviews_need_ankiweb = (
+                reviews.pulled > 0 or reviews.study_days_marked_pending > 0
+            )
             self._review_summary = (
                 f"Reviews: {reviews.pulled} downloaded, {reviews.pushed} uploaded; "
-                f"daily limits: {reviews.study_days_applied} applied."
+                f"daily limits: {reviews.study_days_applied} applied, "
+                f"{reviews.study_days_marked_pending} queued for AnkiWeb."
             )
             if not self._kelma_changes:
                 self._mark_badge_synced(consts.KELMA)
@@ -4729,6 +4767,13 @@ class V2JointStateDialog(QDialog):
                 def synced(ok: bool, text: str) -> None:
                     if ok:
                         self._reviews_need_ankiweb = False
+                        if self._pending_study_signature:
+                            cfg = config.get()
+                            cfg["v2_ankiweb_study_signature"] = (
+                                self._pending_study_signature
+                            )
+                            config.save(cfg)
+                            self._pending_study_signature = ""
                         self.status.setText("Done — this computer, AnkiWeb, and KelmaSync now have the chosen result.")
                         self.publish_btn.setText("Published everywhere ✓")
                     else:

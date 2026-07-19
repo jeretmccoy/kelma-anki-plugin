@@ -159,6 +159,30 @@ class ReviewHistorySyncTest(unittest.TestCase):
         )
         self.assertEqual(col.db.scalar("SELECT usn FROM revlog WHERE id=1002"), -1)
 
+    def test_dual_sync_marks_daily_counters_pending_for_ankiweb(self) -> None:
+        col = FakeCollection()
+        checksum = review_checksum("g1", 0, 3, 10, 1, 2500, 4000, 1)
+        epoch_day = col.crt // 86400 + 5
+        result = sync_reviews_once(
+            col,
+            FakeClient({}),
+            {
+                "reviews": [{"review_id": 1001, "checksum": checksum}],
+                "study_days": [{
+                    "day": epoch_day,
+                    "deck_name": "Deck",
+                    "new_studied": 20,
+                    "review_studied": 50,
+                    "learning_studied": 0,
+                    "milliseconds_studied": 1200,
+                }],
+            },
+            clear_pending_usn=False,
+            mark_study_days_pending=True,
+        )
+        self.assertEqual(result.study_days_marked_pending, 1)
+        self.assertEqual(col.decks.deck["usn"], -1)
+
     def test_orphan_source_id_never_attaches_to_an_unrelated_card(self) -> None:
         col = FakeCollection()
         remote = {
