@@ -134,6 +134,44 @@ class NewestWinsSyncTest(unittest.TestCase):
                     object(), client, server_manifest=server, newest_wins=True
                 )
 
+    def test_unicode_canonical_order_does_not_create_a_note_conflict(self) -> None:
+        local = [{
+            "guid": "g1", "checksum": "local",
+            "modified_at": "2026-07-14T10:00:00Z",
+        }]
+        server = {
+            "server_time": "2026-07-14T10:00:01Z",
+            "notes": [{
+                "guid": "g1", "checksum": "server",
+                "client_modified_at": "2026-07-14T10:00:00.834Z",
+            }],
+        }
+        # The only difference is canonical combining-mark order:
+        # fatha+shadda vs shadda+fatha.
+        local_record = {
+            "guid": "g1", "notetype_id": 1,
+            "fields": ["base\u064e\u0651"], "tags": ["tag"],
+            "client_modified_at": "2026-07-14T10:00:00Z",
+        }
+        server_record = {
+            "guid": "g1", "notetype_id": 1,
+            "fields": ["base\u0651\u064e"], "tags": ["tag"],
+            "client_modified_at": "2026-07-14T10:00:00.834Z",
+        }
+        client = FakeClient(pulled={"notes": [server_record]})
+        with (
+            patch.object(anki_local, "note_manifest", return_value=local),
+            patch.object(anki_local, "note_record", return_value=local_record),
+        ):
+            result = note_sync.sync_notes_once(
+                object(), client, server_manifest=server, newest_wins=True
+            )
+        self.assertEqual(result.pushed, 1)
+        self.assertEqual(client.pull_requests, [{"notes": ["g1"]}])
+        self.assertEqual(
+            client.push_requests[0]["notes"][0]["base_checksum"], "server"
+        )
+
     def test_server_newer_deck_and_notetype_are_pulled(self) -> None:
         deck_local = [{
             "name": "Deck", "checksum": "local",
@@ -219,6 +257,41 @@ class NewestWinsSyncTest(unittest.TestCase):
                 server_manifest=server,
                 newest_wins=True,
                 server_authoritative_keys={"g1:0"},
+            )
+        self.assertEqual(result.pulled, 1)
+        self.assertEqual(result.pushed, 0)
+        self.assertEqual(client.push_requests, [])
+        apply_card.assert_called_once_with(ANY, {"card_id": 2})
+
+    def test_interrupted_note_pull_restores_pristine_generated_card(self) -> None:
+        generated_at = 1_784_044_800
+        local = [{
+            "logical_key": "g1:0",
+            "card_id": generated_at * 1000,
+            "note_id": generated_at * 1000 + 1,
+            "deck_id": 1,
+            "deck_name": "Default",
+            "checksum": "local-default",
+            "modified_at": "2026-07-14T16:00:00Z",
+            "scheduling": {
+                "type": 0, "queue": 0, "ivl": 0, "reps": 0, "lapses": 0,
+            },
+        }]
+        server = {
+            "server_time": "2026-07-14T16:00:01Z",
+            "cards": [{
+                "logical_key": "g1:0", "card_id": 2,
+                "deck_name": "arabic", "checksum": "server-arabic",
+                "client_modified_at": "2026-07-14T11:00:00Z",
+            }],
+        }
+        client = FakeClient(pulled={"cards": [{"card_id": 2}]})
+        with (
+            patch.object(anki_local, "card_manifest", return_value=local),
+            patch.object(anki_apply, "apply_card") as apply_card,
+        ):
+            result = card_sync.sync_cards_once(
+                object(), client, server_manifest=server, newest_wins=True
             )
         self.assertEqual(result.pulled, 1)
         self.assertEqual(result.pushed, 0)
